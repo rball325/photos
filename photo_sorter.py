@@ -342,7 +342,6 @@ class DragDropSorter(tk.Tk):
 
         if speed != 0:
             self.canvas.yview_scroll(speed, "units")
-            print(f"scroll {speed} units")
 
 # Launch the app
 folder_path = "/home/rball/Pictures/Ricks"  # 👈 Update to your folder

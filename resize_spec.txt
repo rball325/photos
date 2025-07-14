@@ -1,0 +1,27 @@
+Write a python script using tkinter that creates a user-interface with:
+- a 'log' window where messages are shown
+- a directory selection widget for the source
+- a directory selection widget for the destination
+- a 'scan' button
+- a 'go' button
+- a 'test' checkbutton
+Both directory selection widgets should remember the value set between runs of the program.
+When the 'scan' button is pressed, go through the 'source' directory tree, and for each photo-type file (jpg, jpeg, tiff, png),
+add an item to the 'source list' where each item contains the path (starting from 'source') of the file.
+At the conclusion of this operation, display the total number of files found, and the total space consumed by all the files, to the log window.
+When the 'go' button is pressed, change the text on the Go button to Stop, and do the following for each file in the 'source list':
+- load the file into memory
+- compute the output file size: if the width of the file is greater than the height, the output height should be 1080 pixels,
+while the output width is set such that the output image aspect ratio matches the input file. If the width of the file is less than or equal to the height,
+the output width should be 1080 pixels, with the height calculated to match the input file aspect ratio.
+- add a line to the log window showing the input size and the calculated new output size.
+If the 'test' button is NOT checked, also do the following for each image:
+- resize the image to match the calculated output size.
+- write the image as a jpg file, using high-quality settings, to the path formed by joining the destination directory with the path from the source list.
+While processing the list, the log window should be updated (refreshed) at least once per second.
+At the conclusion of processing, output a message to the log window showing:
+- the number of files processed
+- the total size of the input files
+- the total size of the output files.
+If the 'Stop' button is pressed during the loop, stop processing, show the results, and reset the Stop button text to Go.
+

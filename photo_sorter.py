@@ -48,7 +48,8 @@ class DragDropSorter(tk.Tk):
         self.canvas.bind_all("<Button-5>", self.on_mousewheel_linux)   # Linux scroll down
         self.canvas.bind("<Button-1>", self.clear_selection_on_background)
         self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
-
+        self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
+        
     def on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
@@ -83,7 +84,7 @@ class DragDropSorter(tk.Tk):
             except Exception:
                 continue
             self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
-        self.after(0, lambda: self.loading_label.config(text="✅ Thumbnails loaded."))
+        self.after(0, lambda: self.loading_label.config(text="✅ Tumbnails loaded."))
 
     def add_thumbnail_to_grid(self, file, photo, idx):
         row = idx // self.max_columns
@@ -93,7 +94,7 @@ class DragDropSorter(tk.Tk):
         lbl.grid(row=row, column=column, padx=5, pady=5)
 
         lbl.bind("<Button-1>", lambda e, l=lbl, i=idx: self.handle_click_and_drag(e, l, i))
-        lbl.bind("<B1-Motion>", self.auto_scroll)
+        lbl.bind("<B1-Motion>", lambda e, l=lbl: self.handle_drag_motion(e, l))
         lbl.bind("<ButtonRelease-1>", self.finish_drag)
 
         self.image_data.append({
@@ -105,9 +106,46 @@ class DragDropSorter(tk.Tk):
         })
         self.loading_label.config(text=f"Loading {len(self.image_data)} of {self.total_files}...")
 
+    def create_drag_cursor(self, event):
+        if getattr(self, "drag_overlay", None):
+            return
+        
+        count = len(self.selected_widgets)
+        if count == 1:
+            img_data = next((d for d in self.image_data if d["label"] == self.selected_widgets[0]), None)
+            if img_data:
+                self.drag_overlay = tk.Toplevel(self)
+                self.drag_overlay.overrideredirect(True)
+                self.drag_overlay.attributes("-topmost", True)
+                img = img_data["photo"]
+                label = tk.Label(self.drag_overlay, image=img, bd=0)
+                label.pack()
+        elif count > 1:
+            self.drag_overlay = tk.Toplevel(self)
+            self.drag_overlay.overrideredirect(True)
+            self.drag_overlay.attributes("-topmost", True)
+            tk.Label(self.drag_overlay, text="📦", font=("Arial", 24)).pack()
+        
+    def move_drag_cursor(self, event):
+        if hasattr(self, 'drag_overlay') and self.drag_overlay:
+            x = event.x_root + 10
+            y = event.y_root + 10
+            self.drag_overlay.geometry(f"+{x}+{y}")
+
+    def destroy_drag_cursor(self, event):
+        if hasattr(self, 'drag_overlay') and self.drag_overlay:
+            self.drag_overlay.destroy()
+            self.drag_overlay = None
+
     def handle_click_and_drag(self, event, label, index):
-        self.dragged_widget = label
-        self.handle_click(event, label, index)
+            self.dragged_widget = label
+            self.handle_click(event, label, index)
+
+    def handle_drag_motion(self, event, label):
+        self.dragged_widget = label  # Prep drag target
+        self.create_drag_cursor(event)  # Show drag visual
+        self.auto_scroll(event)        # Scroll if near edge
+        self.move_drag_cursor(event)   # Move overlay
 
     def handle_click(self, event, label, index):
         ctrl_pressed = (event.state & 0x0004) != 0
@@ -148,6 +186,7 @@ class DragDropSorter(tk.Tk):
 
     def finish_drag(self, event):
         self.canvas.unbind("<Motion>")
+        self.destroy_drag_cursor(event)
         x = event.x_root - self.frame.winfo_rootx()
         y = event.y_root - self.frame.winfo_rooty()
         target = None
@@ -165,7 +204,6 @@ class DragDropSorter(tk.Tk):
             target_idx = next((i for i, d in enumerate(remaining) if d["label"] == target), len(remaining))
             self.image_data = remaining[:target_idx] + group + remaining[target_idx:]
             self.redraw_grid()
-            print(f"Swapping group to index {target_idx}")
 
     def set_dragged_widget(self, label):
         self.dragged_widget = label

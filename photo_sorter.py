@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk
 import os, json, threading, datetime
+from send2trash import send2trash
 
 class DragDropSorter(tk.Tk):
     def __init__(self, folder):
@@ -49,7 +50,7 @@ class DragDropSorter(tk.Tk):
         self.canvas.bind("<Button-1>", self.clear_selection_on_background)
         self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
-        
+        self.bind_all("<Delete>", self.delete_selected_thumbnails)        
     def on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
@@ -105,6 +106,30 @@ class DragDropSorter(tk.Tk):
             "column": column
         })
         self.loading_label.config(text=f"Loading {len(self.image_data)} of {self.total_files}...")
+
+    def delete_selected_thumbnails(self, event=None):
+        if not self.selected_widgets:
+            messagebox.showwarning(
+                title="⚠️ System Alert",
+                message="Nothing selected!")
+
+            return
+
+        to_delete = [d for d in self.image_data if d["label"] in self.selected_widgets]
+        for data in to_delete:
+            path = os.path.join(self.folder, data["filename"])
+            try:
+                send2trash(path)
+                print(f"🗑️ Deleted {path}")
+            except Exception as e:
+                print(f"⚠️ Could not delete {path}: {e}")
+                continue
+            data["label"].destroy()
+            self.image_data.remove(data)
+
+        self.selected_widgets.clear()
+        self.last_clicked_index = None
+        self.redraw_grid()
 
     def create_drag_cursor(self, event):
         if getattr(self, "drag_overlay", None):

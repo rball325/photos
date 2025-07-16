@@ -9,6 +9,7 @@ class DragDropSorter(tk.Tk):
         super().__init__()
         self.title("Photo DnD Grid Sorter")
         self.geometry("960x720")
+        self.protocol("WM_DELETE_WINDOW", self.on_app_close)
         self.folder = folder
         self.thumb_size = (120, 120)
         self.max_columns = 6
@@ -51,6 +52,27 @@ class DragDropSorter(tk.Tk):
         self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
+
+    def set_on_disk_order(self):
+        self.on_disk_order = [d["filename"] for d in self.image_data]
+        #print(f"Set ODO to: {self.on_disk_order}")
+
+    def on_app_close(self):
+        # check for unsaved reordering, if loading is complete
+        if hasattr(self, 'on_disk_order'):
+            current_order = [f["filename"] for f in self.image_data]
+            #print(f"Current: {current_order}")
+            #print(f"On-Disk: {self.on_disk_order}")
+            if self.on_disk_order != current_order:
+                confirm = messagebox.askyesno(
+                    "Pending Changes",
+                    "You’ve reordered files but haven’t renamed them.\nExit without saving?"
+                )
+                if not confirm:
+                    return
+
+        self.destroy()
+
     def on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
@@ -88,7 +110,7 @@ class DragDropSorter(tk.Tk):
                 self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
             except Exception:
                 pass
-
+        self.after(0, lambda: self.set_on_disk_order())
         self.after(0, lambda: self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded."))
 
     def add_thumbnail_to_grid(self, file, photo, idx):
@@ -133,6 +155,7 @@ class DragDropSorter(tk.Tk):
 
         self.selected_widgets.clear()
         self.last_clicked_index = None
+        self.set_on_disk_order()
         self.redraw_grid()
 
     def create_drag_cursor(self, event):
@@ -167,8 +190,10 @@ class DragDropSorter(tk.Tk):
             self.drag_overlay = None
 
     def handle_click_and_drag(self, event, label, index):
-            self.dragged_widget = label
-            self.handle_click(event, label, index)
+        if not hasattr(self, 'on_disk_order'):
+            return
+        self.dragged_widget = label
+        self.handle_click(event, label, index)
 
     def handle_drag_motion(self, event, label):
         self.dragged_widget = label  # Prep drag target
@@ -298,6 +323,7 @@ class DragDropSorter(tk.Tk):
             self.image_data[idx - 1]["filename"] = final_name
             log_entries[idx - 1]["final"] = final_name
             
+        self.set_on_disk_order()
         self.loading_label.config(text=f"File renames complete.")
 
         # Save JSON log

@@ -84,7 +84,11 @@ class DragDropSorter(tk.Tk):
                 photo = ImageTk.PhotoImage(img)
             except Exception:
                 continue
-            self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
+            try:
+                self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
+            except Exception:
+                pass
+
         self.after(0, lambda: self.loading_label.config(text="✅ Tumbnails loaded."))
 
     def add_thumbnail_to_grid(self, file, photo, idx):

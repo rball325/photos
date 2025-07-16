@@ -89,7 +89,7 @@ class DragDropSorter(tk.Tk):
             except Exception:
                 pass
 
-        self.after(0, lambda: self.loading_label.config(text="✅ Tumbnails loaded."))
+        self.after(0, lambda: self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded."))
 
     def add_thumbnail_to_grid(self, file, photo, idx):
         row = idx // self.max_columns
@@ -114,7 +114,7 @@ class DragDropSorter(tk.Tk):
     def delete_selected_thumbnails(self, event=None):
         if not self.selected_widgets:
             messagebox.showwarning(
-                title="⚠️ System Alert",
+                title="⚠️ Delete",
                 message="Nothing selected!")
 
             return

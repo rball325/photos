@@ -1,27 +1,63 @@
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import filedialog
 from PIL import Image, ImageTk
 import os, json, threading, datetime
 from send2trash import send2trash
 
+CONFIG_PATH = "config.json"
+
 class DragDropSorter(tk.Tk):
-    def __init__(self, folder):
+
+    def load_config(self):
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r") as f:
+                config = json.load(f)
+                self.image_directory = config.get("image_directory", "")
+        else:
+            self.image_directory = ""
+
+    def save_config(self):
+        with open(CONFIG_PATH, "w") as f:
+            json.dump({"image_directory": self.image_directory}, f)
+
+    def __init__(self):
         super().__init__()
         self.title("Photo DnD Grid Sorter")
         self.geometry("960x720")
         self.protocol("WM_DELETE_WINDOW", self.on_app_close)
-        self.folder = folder
         self.thumb_size = (120, 120)
+        self.image_directory = ""
         self.max_columns = 6
         self.image_data = []
         self.image_files = []
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
+
+        self.load_config()
+
         self.create_ui()
-        self.start_thumbnail_loading()
+        self.folder_entry.insert(0, self.image_directory)
+        #self.start_thumbnail_loading()
 
     def create_ui(self):
+        source_frame = tk.Frame(self)
+        
+        self.folder_label = tk.Label(source_frame, text="Image Folder:")
+        self.folder_label.pack(side="left")
+
+        self.folder_entry = tk.Entry(source_frame, width=50)
+        self.folder_entry.pack(side="left", expand=True, fill="x")
+
+        self.load_button = tk.Button(source_frame, text="Load", command=self.load_from_entry)
+        self.load_button.pack(side="left")
+
+        self.browse_button = tk.Button(source_frame, text="Browse...", command=self.choose_directory)
+        self.browse_button.pack(side="left")
+
+        source_frame.pack(pady=5)
+
         prefix_frame = tk.Frame(self)
         tk.Label(prefix_frame, text="Filename Prefix:").pack(side="left")
         self.prefix_entry = tk.Entry(prefix_frame)
@@ -32,7 +68,7 @@ class DragDropSorter(tk.Tk):
         tk.Button(self, text="Rename & Save Order", command=self.save_order).pack(pady=2)
         tk.Button(self, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
 
-        self.loading_label = tk.Label(self, text="Loading thumbnails...")
+        self.loading_label = tk.Label(self, text="Click 'Load' to load thumbnails")
         self.loading_label.pack(pady=5)
 
         self.canvas = tk.Canvas(self)
@@ -52,6 +88,21 @@ class DragDropSorter(tk.Tk):
         self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
+
+    def choose_directory(self):
+        selected_dir = filedialog.askdirectory()
+        if selected_dir:
+            self.image_directory = selected_dir
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, selected_dir)
+            self.save_config()
+
+    def load_from_entry(self):
+        path = self.folder_entry.get()
+        if os.path.exists(path):
+            self.image_directory = path
+            self.save_config()
+            self.start_thumbnail_loading()
 
     def set_on_disk_order(self):
         self.on_disk_order = [d["filename"] for d in self.image_data]
@@ -92,19 +143,20 @@ class DragDropSorter(tk.Tk):
             self.last_clicked_index = None
 
     def start_thumbnail_loading(self):
-        self.image_files = [f for f in sorted(os.listdir(self.folder))
+        self.image_files = [f for f in sorted(os.listdir(self.image_directory))
                             if f.lower().endswith((".jpg", ".jpeg", ".png"))]
         self.total_files = len(self.image_files)
         threading.Thread(target=self.load_thumbnails_thread, daemon=True).start()
 
     def load_thumbnails_thread(self):
         for idx, file in enumerate(self.image_files):
-            img_path = os.path.join(self.folder, file)
+            img_path = os.path.join(self.image_directory, file)
             try:
                 img = Image.open(img_path)
                 img.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
             except Exception:
+                print(f"Failed to open file {file}")
                 continue
             try:
                 self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
@@ -143,7 +195,7 @@ class DragDropSorter(tk.Tk):
 
         to_delete = [d for d in self.image_data if d["label"] in self.selected_widgets]
         for data in to_delete:
-            path = os.path.join(self.folder, data["filename"])
+            path = os.path.join(self.image_directory, data["filename"])
             try:
                 send2trash(path)
                 print(f"🗑️ Deleted {path}")
@@ -294,10 +346,10 @@ class DragDropSorter(tk.Tk):
         log_entries, temp_names = [], []
 
         for idx, data in enumerate(self.image_data, start=1):
-            old_path = os.path.join(self.folder, data["filename"])
+            old_path = os.path.join(self.image_directory, data["filename"])
             ext = os.path.splitext(data["filename"])[1].lower()
             temp_name = f"_temp_{idx:03d}{ext}"
-            temp_path = os.path.join(self.folder, temp_name)
+            temp_path = os.path.join(self.image_directory, temp_name)
             try:
                 os.rename(old_path, temp_path)
             except Exception as e:
@@ -309,7 +361,7 @@ class DragDropSorter(tk.Tk):
 
         for idx, (temp_path, ext) in enumerate(temp_names, start=1):
             final_name = f"{prefix}{idx:03d}{ext}"
-            final_path = os.path.join(self.folder, final_name)
+            final_path = os.path.join(self.image_directory, final_name)
             if os.path.exists(final_path) and os.path.basename(temp_path) != final_name:
                 overwrite = messagebox.askyesno("Conflict Warning",
                     f"File '{final_name}' already exists.\nOverwrite?")
@@ -329,7 +381,7 @@ class DragDropSorter(tk.Tk):
         # Save JSON log
         timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
         log_name = f"rename_log_{timestamp}.json"
-        log_path = os.path.join(self.folder, log_name)
+        log_path = os.path.join(self.image_directory, log_name)
         try:
             with open(log_path, "w") as f:
                 json.dump({
@@ -344,12 +396,12 @@ class DragDropSorter(tk.Tk):
         self.redraw_grid()
 
     def restore_from_log(self):
-        logs = [f for f in os.listdir(self.folder) if f.startswith("rename_log_") and f.endswith(".json")]
+        logs = [f for f in os.listdir(self.image_directory) if f.startswith("rename_log_") and f.endswith(".json")]
         if not logs:
             messagebox.showerror("Restore Error", "No rename logs found.")
             return
         logs.sort(reverse=True)
-        log_path = os.path.join(self.folder, logs[0])
+        log_path = os.path.join(self.image_directory, logs[0])
         try:
             with open(log_path, "r") as f:
                 log = json.load(f)
@@ -361,8 +413,8 @@ class DragDropSorter(tk.Tk):
 
         restored = 0
         for entry in log.get("files", []):
-            final = os.path.join(self.folder, entry.get("final", entry["temporary"]))
-            original = os.path.join(self.folder, entry["original"])
+            final = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
+            original = os.path.join(self.image_directory, entry["original"])
             if os.path.exists(original) and final != original:
                 overwrite = messagebox.askyesno("Conflict Warning",
                     f"File '{entry['original']}' already exists.\nOverwrite?")
@@ -399,6 +451,5 @@ class DragDropSorter(tk.Tk):
             self.canvas.yview_scroll(speed, "units")
 
 # Launch the app
-folder_path = "/home/rball/Pictures/Ricks"  # 👈 Update to your folder
-app = DragDropSorter(folder_path)
+app = DragDropSorter()
 app.mainloop()

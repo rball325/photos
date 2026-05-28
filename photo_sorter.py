@@ -7,6 +7,93 @@ from send2trash import send2trash
 
 CONFIG_PATH = "config.json"
 
+
+class ImageViewer(tk.Toplevel):
+    def __init__(self, master, image_path):
+        super().__init__(master)
+        self.title(os.path.basename(image_path))
+        self.geometry("800x600")
+        self._image = Image.open(image_path)
+        self._scale = 1.0
+        self._offset = [0.0, 0.0]
+        self._drag_start = None
+        self._photo = None
+        self._zoom_var = tk.StringVar(value="100%")
+
+        toolbar = tk.Frame(self)
+        tk.Button(toolbar, text="−", width=2, command=self.zoom_out).pack(side="left", padx=2)
+        tk.Button(toolbar, text="+", width=2, command=self.zoom_in).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Fit", command=self.reset_zoom).pack(side="left", padx=2)
+        tk.Label(toolbar, textvariable=self._zoom_var, width=6, anchor="w").pack(side="left", padx=5)
+        toolbar.pack(side="top", fill="x", pady=2)
+
+        self._canvas = tk.Canvas(self, bg="black", cursor="fleur")
+        self._canvas.pack(fill="both", expand=True)
+
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._canvas.bind("<Button-4>", self._on_scroll_linux)
+        self._canvas.bind("<Button-5>", self._on_scroll_linux)
+        self._canvas.bind("<ButtonPress-1>", self._on_pan_start)
+        self._canvas.bind("<B1-Motion>", self._on_pan_move)
+
+        self.after(100, self._fit_to_window)
+
+    def _fit_to_window(self):
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            self.after(50, self._fit_to_window)
+            return
+        iw, ih = self._image.size
+        self._scale = min(cw / iw, ch / ih, 1.0)
+        self._offset = [cw / 2.0, ch / 2.0]
+        self._redraw()
+
+    def _redraw(self):
+        self._canvas.delete("all")
+        iw, ih = self._image.size
+        new_w = max(1, int(iw * self._scale))
+        new_h = max(1, int(ih * self._scale))
+        resized = self._image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(resized)
+        self._canvas.create_image(int(self._offset[0]), int(self._offset[1]),
+                                   image=self._photo, anchor="center")
+        self._zoom_var.set(f"{int(self._scale * 100)}%")
+
+    def _zoom_at(self, factor, cx, cy):
+        old = self._scale
+        self._scale = max(0.05, min(self._scale * factor, 20.0))
+        r = self._scale / old
+        self._offset[0] = cx + (self._offset[0] - cx) * r
+        self._offset[1] = cy + (self._offset[1] - cy) * r
+        self._redraw()
+
+    def _on_mousewheel(self, event):
+        self._zoom_at(1.1 if event.delta > 0 else 1 / 1.1, event.x, event.y)
+
+    def _on_scroll_linux(self, event):
+        self._zoom_at(1.1 if event.num == 4 else 1 / 1.1, event.x, event.y)
+
+    def zoom_in(self):
+        self._zoom_at(1.25, self._canvas.winfo_width() / 2, self._canvas.winfo_height() / 2)
+
+    def zoom_out(self):
+        self._zoom_at(1 / 1.25, self._canvas.winfo_width() / 2, self._canvas.winfo_height() / 2)
+
+    def reset_zoom(self):
+        self._fit_to_window()
+
+    def _on_pan_start(self, event):
+        self._drag_start = (event.x, event.y)
+
+    def _on_pan_move(self, event):
+        if self._drag_start:
+            self._offset[0] += event.x - self._drag_start[0]
+            self._offset[1] += event.y - self._drag_start[1]
+            self._drag_start = (event.x, event.y)
+            self._redraw()
+
+
 class DragDropSorter(tk.Tk):
 
     def load_config(self):
@@ -174,6 +261,7 @@ class DragDropSorter(tk.Tk):
         lbl.grid(row=row, column=column, padx=5, pady=5)
 
         lbl.bind("<Button-1>", lambda e, l=lbl, i=idx: self.handle_click_and_drag(e, l, i))
+        lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
         lbl.bind("<B1-Motion>", lambda e, l=lbl: self.handle_drag_motion(e, l))
         lbl.bind("<ButtonRelease-1>", self.finish_drag)
 
@@ -185,6 +273,10 @@ class DragDropSorter(tk.Tk):
             "column": column
         })
         self.loading_label.config(text=f"Loading {len(self.image_data)} of {self.total_files}...")
+
+    def open_image_viewer(self, filename):
+        path = os.path.join(self.image_directory, filename)
+        ImageViewer(self, path)
 
     def delete_selected_thumbnails(self, event=None):
         if not self.selected_widgets:

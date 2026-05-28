@@ -121,6 +121,7 @@ class DragDropSorter(tk.Tk):
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
+        self._is_dragging = False
 
         self.load_config()
 
@@ -341,6 +342,7 @@ class DragDropSorter(tk.Tk):
         self.handle_click(event, label, index)
 
     def handle_drag_motion(self, event, label):
+        self._is_dragging = True
         self.dragged_widget = label  # Prep drag target
         self.create_drag_cursor(event)  # Show drag visual
         self.auto_scroll(event)        # Scroll if near edge
@@ -397,12 +399,19 @@ class DragDropSorter(tk.Tk):
                lbl.winfo_y() <= y <= lbl.winfo_y() + lbl.winfo_height():
                 target = lbl
                 break
-        if target and self.selected_widgets:
+        if self.selected_widgets:
             group = [d for d in self.image_data if d["label"] in self.selected_widgets]
             remaining = [d for d in self.image_data if d["label"] not in self.selected_widgets]
-            target_idx = next((i for i, d in enumerate(remaining) if d["label"] == target), len(remaining))
-            self.image_data = remaining[:target_idx] + group + remaining[target_idx:]
-            self.redraw_grid()
+            if target:
+                target_idx = next((i for i, d in enumerate(remaining) if d["label"] == target), len(remaining))
+            elif self._is_dragging:
+                target_idx = len(remaining)  # drop past last item → append to end
+            else:
+                target_idx = None
+            if target_idx is not None:
+                self.image_data = remaining[:target_idx] + group + remaining[target_idx:]
+                self.redraw_grid()
+        self._is_dragging = False
 
     def set_dragged_widget(self, label):
         self.dragged_widget = label

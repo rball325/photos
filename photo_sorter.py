@@ -166,8 +166,9 @@ class DragDropSorter(tk.Tk):
         self.after(0, lambda: self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded."))
 
     def add_thumbnail_to_grid(self, file, photo, idx):
-        row = idx // self.max_columns
-        column = idx % self.max_columns
+        position = len(self.image_data)
+        row = position // self.max_columns
+        column = position % self.max_columns
         lbl = tk.Label(self.frame, image=photo, bd=2, relief="raised")
         lbl.image = photo
         lbl.grid(row=row, column=column, padx=5, pady=5)

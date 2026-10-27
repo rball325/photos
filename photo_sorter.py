@@ -2,10 +2,43 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk
-import os, json, threading, datetime, calendar
+import os, json, threading, datetime, calendar, re
 from send2trash import send2trash
 
 CONFIG_PATH = "config.json"
+
+DATE_PATTERNS = [
+    (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),
+    (re.compile(r'\b(\d{4})(\d{2})(\d{2})\b'), 'ymd'),
+    (re.compile(r'\b(\d{4})[-_](\d{2})\b'), 'ym'),
+    (re.compile(r'\b(\d{4})\b'), 'y'),
+    (re.compile(r'\b(\d{3}0)s\b'), 'y'),  # decade folder, e.g. "1950s" -> 1950-01-01
+]
+
+
+def infer_date_from_path(path):
+    """Scan path components leaf-first for a date, falling back to just a year (Jan 1)."""
+    parts = [p for p in os.path.normpath(path).split(os.sep) if p]
+    for part in reversed(parts):
+        for pattern, kind in DATE_PATTERNS:
+            match = pattern.search(part)
+            if not match:
+                continue
+            try:
+                if kind == 'ymd':
+                    year, month, day = (int(g) for g in match.groups())
+                    return datetime.date(year, month, day)
+                elif kind == 'ym':
+                    year, month = (int(g) for g in match.groups())
+                    return datetime.date(year, month, 1)
+                else:
+                    year = int(match.group(1))
+                    if not (1800 <= year <= 2100):
+                        continue
+                    return datetime.date(year, 1, 1)
+            except ValueError:
+                continue
+    return None
 
 
 class DatePickerDialog(tk.Toplevel):
@@ -230,6 +263,7 @@ class DragDropSorter(tk.Tk):
         self.prefix_entry = tk.Entry(prefix_frame)
         self.prefix_entry.pack(side="left", padx=5)
         tk.Button(prefix_frame, text="📅", command=self.choose_date_prefix).pack(side="left")
+        tk.Button(prefix_frame, text="Auto", command=self.auto_set_prefix).pack(side="left", padx=(5, 0))
         prefix_frame.pack(pady=5)
 
         tk.Button(self, text="Preview Rename", command=self.preview_order).pack(pady=2)
@@ -263,6 +297,17 @@ class DragDropSorter(tk.Tk):
         if dialog.result:
             self.prefix_entry.delete(0, tk.END)
             self.prefix_entry.insert(0, dialog.result.strftime("%Y-%m-%d") + "_")
+
+    def auto_set_prefix(self):
+        if not self.image_directory:
+            messagebox.showinfo("Auto Prefix", "Load an image folder first.")
+            return
+        date = infer_date_from_path(self.image_directory)
+        if date is None:
+            messagebox.showinfo("Auto Prefix", "Couldn't determine a date from the folder path.")
+            return
+        self.prefix_entry.delete(0, tk.END)
+        self.prefix_entry.insert(0, date.strftime("%Y-%m-%d") + "_")
 
     def choose_directory(self):
         selected_dir = filedialog.askdirectory()

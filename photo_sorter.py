@@ -118,6 +118,9 @@ class DragDropSorter(tk.Tk):
         self.max_columns = 6
         self.image_data = []
         self.image_files = []
+        self.folder_data = []
+        self.folder_names = []
+        self.grid_row_offset = 0
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
@@ -188,28 +191,58 @@ class DragDropSorter(tk.Tk):
     def load_from_entry(self):
         path = self.folder_entry.get()
         if os.path.exists(path):
+            if not self.check_unsaved_changes():
+                return
             self.image_directory = path
             self.save_config()
+            self.clear_grid()
             self.start_thumbnail_loading()
+
+    def navigate_to_folder(self, folder_name):
+        if not self.check_unsaved_changes():
+            return
+        current = self.image_directory.rstrip(os.sep)
+        if folder_name == "..":
+            new_dir = os.path.dirname(current)
+        else:
+            new_dir = os.path.join(current, folder_name)
+        if not os.path.isdir(new_dir):
+            return
+        self.image_directory = new_dir
+        self.folder_entry.delete(0, tk.END)
+        self.folder_entry.insert(0, new_dir)
+        self.save_config()
+        self.clear_grid()
+        self.start_thumbnail_loading()
+
+    def clear_grid(self):
+        for widget in self.frame.winfo_children():
+            widget.destroy()
+        self.image_data.clear()
+        self.folder_data = []
+        self.selected_widgets.clear()
+        self.last_clicked_index = None
+        if hasattr(self, 'on_disk_order'):
+            del self.on_disk_order
 
     def set_on_disk_order(self):
         self.on_disk_order = [d["filename"] for d in self.image_data]
         #print(f"Set ODO to: {self.on_disk_order}")
 
-    def on_app_close(self):
+    def check_unsaved_changes(self):
         # check for unsaved reordering, if loading is complete
         if hasattr(self, 'on_disk_order'):
             current_order = [f["filename"] for f in self.image_data]
-            #print(f"Current: {current_order}")
-            #print(f"On-Disk: {self.on_disk_order}")
             if self.on_disk_order != current_order:
-                confirm = messagebox.askyesno(
+                return messagebox.askyesno(
                     "Pending Changes",
-                    "You’ve reordered files but haven’t renamed them.\nExit without saving?"
+                    "You’ve reordered files but haven’t renamed them.\nLeave without saving?"
                 )
-                if not confirm:
-                    return
+        return True
 
+    def on_app_close(self):
+        if not self.check_unsaved_changes():
+            return
         self.destroy()
 
     def on_mousewheel(self, event):
@@ -231,10 +264,33 @@ class DragDropSorter(tk.Tk):
             self.last_clicked_index = None
 
     def start_thumbnail_loading(self):
-        self.image_files = [f for f in sorted(os.listdir(self.image_directory))
+        entries = sorted(os.listdir(self.image_directory))
+        self.folder_names = [d for d in entries
+                              if os.path.isdir(os.path.join(self.image_directory, d))]
+        parent = os.path.dirname(self.image_directory.rstrip(os.sep))
+        if parent and parent != self.image_directory.rstrip(os.sep):
+            self.folder_names = [".."] + self.folder_names
+        self.image_files = [f for f in entries
                             if f.lower().endswith((".jpg", ".jpeg", ".png"))]
         self.total_files = len(self.image_files)
+        self.grid_row_offset = 0
+        if self.folder_names:
+            self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
+            self.add_folder_widgets()
         threading.Thread(target=self.load_thumbnails_thread, daemon=True).start()
+
+    def add_folder_widgets(self):
+        self.folder_data = []
+        for idx, name in enumerate(self.folder_names):
+            row = idx // self.max_columns
+            column = idx % self.max_columns
+            display = ".. (parent)" if name == ".." else name
+            lbl = tk.Label(self.frame, text=f"📁 {display}", width=14, height=6,
+                           wraplength=100, justify="center",
+                           bg="#dde8f5", bd=2, relief="raised")
+            lbl.grid(row=row, column=column, padx=5, pady=5)
+            lbl.bind("<Button-1>", lambda e, n=name: self.navigate_to_folder(n))
+            self.folder_data.append({"name": name, "label": lbl})
 
     def load_thumbnails_thread(self):
         for idx, file in enumerate(self.image_files):
@@ -255,7 +311,7 @@ class DragDropSorter(tk.Tk):
 
     def add_thumbnail_to_grid(self, file, photo, idx):
         position = len(self.image_data)
-        row = position // self.max_columns
+        row = self.grid_row_offset + position // self.max_columns
         column = position % self.max_columns
         lbl = tk.Label(self.frame, image=photo, bd=2, relief="raised")
         lbl.image = photo
@@ -418,7 +474,8 @@ class DragDropSorter(tk.Tk):
         pass
 
     def redraw_grid(self):
-        row = column = 0
+        row = self.grid_row_offset
+        column = 0
         for data in self.image_data:
             lbl = data["label"]
             lbl.grid(row=row, column=column, padx=5, pady=5)
@@ -528,9 +585,7 @@ class DragDropSorter(tk.Tk):
             except Exception as e:
                 print(f"⚠️ Could not restore {entry['final']}: {e}")
         messagebox.showinfo("Restore Complete", f"Restored {restored} files from {logs[0]}")
-        self.image_data.clear()
-        for widget in self.frame.winfo_children():
-            widget.destroy()
+        self.clear_grid()
         self.start_thumbnail_loading()
 
     def auto_scroll(self, event):

@@ -427,18 +427,21 @@ class DragDropSorter(tk.Tk):
             try:
                 img = Image.open(img_path)
                 img.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-            except Exception:
-                print(f"Failed to open file {file}")
+                img.load()
+            except Exception as e:
+                print(f"Failed to open file {file}: {e}")
                 continue
             try:
-                self.after(0, self.add_thumbnail_to_grid, file, photo, idx)
+                self.after(0, self.add_thumbnail_to_grid, file, img, idx)
             except Exception:
                 pass
         self.after(0, lambda: self.set_on_disk_order())
         self.after(0, lambda: self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded."))
 
-    def add_thumbnail_to_grid(self, file, photo, idx):
+    def add_thumbnail_to_grid(self, file, img, idx):
+        # PhotoImage must be created on the main thread (Tcl/Tk is not thread-safe),
+        # so the background loader hands us a plain PIL Image to convert here.
+        photo = ImageTk.PhotoImage(img)
         position = len(self.image_data)
         row = self.grid_row_offset + position // self.max_columns
         column = position % self.max_columns

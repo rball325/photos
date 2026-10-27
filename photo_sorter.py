@@ -2,10 +2,86 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk
-import os, json, threading, datetime
+import os, json, threading, datetime, calendar
 from send2trash import send2trash
 
 CONFIG_PATH = "config.json"
+
+
+class DatePickerDialog(tk.Toplevel):
+    def __init__(self, master, initial=None):
+        super().__init__(master)
+        self.title("Choose Date")
+        self.resizable(False, False)
+        self.result = None
+        self._date = (initial or datetime.date.today()).replace(day=1)
+
+        entry_frame = tk.Frame(self)
+        tk.Label(entry_frame, text="Date (YYYY-mm-dd):").pack(side="left")
+        self.entry_var = tk.StringVar(value=(initial or datetime.date.today()).strftime("%Y-%m-%d"))
+        entry = tk.Entry(entry_frame, textvariable=self.entry_var, width=12)
+        entry.pack(side="left", padx=5)
+        entry.bind("<Return>", lambda e: self._accept_entry())
+        tk.Button(entry_frame, text="Use", command=self._accept_entry).pack(side="left")
+        entry_frame.pack(padx=5, pady=5)
+
+        nav_frame = tk.Frame(self)
+        tk.Button(nav_frame, text="<", width=2, command=self._prev_month).pack(side="left")
+        self.month_label = tk.Label(nav_frame, width=15, anchor="center")
+        self.month_label.pack(side="left")
+        tk.Button(nav_frame, text=">", width=2, command=self._next_month).pack(side="left")
+        nav_frame.pack(pady=2)
+
+        self.cal_frame = tk.Frame(self)
+        self.cal_frame.pack(padx=5, pady=5)
+
+        self._render_calendar()
+        self.transient(master)
+        self.grab_set()
+
+    def _accept_entry(self):
+        text = self.entry_var.get().strip()
+        try:
+            picked = datetime.datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            messagebox.showerror("Invalid Date", "Enter a date as YYYY-mm-dd.")
+            return
+        self.result = picked
+        self.destroy()
+
+    def _shift_month(self, delta):
+        year, month = self._date.year, self._date.month + delta
+        if month == 0:
+            year, month = year - 1, 12
+        elif month == 13:
+            year, month = year + 1, 1
+        self._date = self._date.replace(year=year, month=month, day=1)
+        self._render_calendar()
+
+    def _prev_month(self):
+        self._shift_month(-1)
+
+    def _next_month(self):
+        self._shift_month(1)
+
+    def _render_calendar(self):
+        for widget in self.cal_frame.winfo_children():
+            widget.destroy()
+        self.month_label.config(text=self._date.strftime("%B %Y"))
+        for col, name in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
+            tk.Label(self.cal_frame, text=name, width=3).grid(row=0, column=col)
+        cal = calendar.Calendar(firstweekday=0)
+        for row, week in enumerate(cal.monthdayscalendar(self._date.year, self._date.month), start=1):
+            for col, day in enumerate(week):
+                if day == 0:
+                    tk.Label(self.cal_frame, text="", width=3).grid(row=row, column=col)
+                else:
+                    tk.Button(self.cal_frame, text=str(day), width=3,
+                              command=lambda d=day: self._pick_day(d)).grid(row=row, column=col)
+
+    def _pick_day(self, day):
+        self.result = self._date.replace(day=day)
+        self.destroy()
 
 
 class ImageViewer(tk.Toplevel):
@@ -153,6 +229,7 @@ class DragDropSorter(tk.Tk):
         tk.Label(prefix_frame, text="Filename Prefix:").pack(side="left")
         self.prefix_entry = tk.Entry(prefix_frame)
         self.prefix_entry.pack(side="left", padx=5)
+        tk.Button(prefix_frame, text="📅", command=self.choose_date_prefix).pack(side="left")
         prefix_frame.pack(pady=5)
 
         tk.Button(self, text="Preview Rename", command=self.preview_order).pack(pady=2)
@@ -179,6 +256,13 @@ class DragDropSorter(tk.Tk):
         self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
+
+    def choose_date_prefix(self):
+        dialog = DatePickerDialog(self)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.prefix_entry.delete(0, tk.END)
+            self.prefix_entry.insert(0, dialog.result.strftime("%Y-%m-%d") + "_")
 
     def choose_directory(self):
         selected_dir = filedialog.askdirectory()

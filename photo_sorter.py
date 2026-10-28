@@ -339,7 +339,9 @@ class DragDropSorter(tk.Tk):
         self.prefix_entry.insert(0, date.strftime("%Y-%m-%d") + "_")
 
     def choose_directory(self):
-        selected_dir = filedialog.askdirectory()
+        initial = self.folder_entry.get().strip() or self.image_directory
+        kwargs = {"initialdir": initial} if initial and os.path.isdir(initial) else {}
+        selected_dir = filedialog.askdirectory(**kwargs)
         if selected_dir:
             self.image_directory = selected_dir
             self.folder_entry.delete(0, tk.END)

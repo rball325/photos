@@ -4,8 +4,37 @@ from tkinter import filedialog
 from PIL import Image, ImageTk
 import os, json, threading, datetime, calendar, re
 from send2trash import send2trash
+import piexif
 
 CONFIG_PATH = "config.json"
+
+PREFIX_DATE_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})_')
+JPEG_EXTENSIONS = (".jpg", ".jpeg")
+
+
+def parse_date_from_prefix(prefix):
+    """Extract a leading YYYY-MM-DD_ date from a rename prefix, if present."""
+    match = PREFIX_DATE_RE.match(prefix)
+    if not match:
+        return None
+    try:
+        return datetime.date(*(int(g) for g in match.groups()))
+    except ValueError:
+        return None
+
+
+def set_jpeg_date_taken(path, date):
+    """Write date into JPEG EXIF date tags by editing only the EXIF segment
+    in place -- the compressed image data is never touched/re-encoded."""
+    exif_date = date.strftime("%Y:%m:%d 00:00:00")
+    try:
+        exif_dict = piexif.load(path)
+    except Exception:
+        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_date
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_date
+    piexif.insert(piexif.dump(exif_dict), path)
 
 DATE_PATTERNS = [
     (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),
@@ -634,6 +663,7 @@ class DragDropSorter(tk.Tk):
         prefix = self.prefix_entry.get().strip()
         if prefix and not prefix.endswith("_"):
             prefix += "_"
+        prefix_date = parse_date_from_prefix(prefix)
         log_entries, temp_names = [], []
 
         for idx, data in enumerate(self.image_data, start=1):
@@ -665,7 +695,14 @@ class DragDropSorter(tk.Tk):
                 continue
             self.image_data[idx - 1]["filename"] = final_name
             log_entries[idx - 1]["final"] = final_name
-            
+
+            if prefix_date and ext in JPEG_EXTENSIONS:
+                try:
+                    set_jpeg_date_taken(final_path, prefix_date)
+                    log_entries[idx - 1]["exif_date"] = prefix_date.isoformat()
+                except Exception as e:
+                    print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
+
         self.set_on_disk_order()
         self.loading_label.config(text=f"File renames complete.")
 
@@ -739,6 +776,6 @@ class DragDropSorter(tk.Tk):
         if speed != 0:
             self.canvas.yview_scroll(speed, "units")
 
-# Launch the app
-app = DragDropSorter()
-app.mainloop()
+if __name__ == "__main__":
+    app = DragDropSorter()
+    app.mainloop()

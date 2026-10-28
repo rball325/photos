@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk
-import os, json, threading, datetime, calendar, re, math
+import os, json, threading, datetime, calendar, re, shutil, math
 from send2trash import send2trash
 import piexif
 
@@ -35,6 +35,20 @@ def set_jpeg_date_taken(path, date):
     exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
     exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_date
     piexif.insert(piexif.dump(exif_dict), path)
+
+
+def find_next_index(directory, prefix):
+    """Scan an existing directory for files already named <prefix><digits><ext>
+    and return the next unused index, so a batch moved there won't collide."""
+    pattern = re.compile(r'^' + re.escape(prefix) + r'(\d+)\.[^.]+$', re.IGNORECASE)
+    max_idx = 0
+    if os.path.isdir(directory):
+        for f in os.listdir(directory):
+            match = pattern.match(f)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+    return max_idx + 1
+
 
 DATE_PATTERNS = [
     (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),
@@ -256,12 +270,17 @@ class DragDropSorter(tk.Tk):
             with open(CONFIG_PATH, "r") as f:
                 config = json.load(f)
                 self.image_directory = config.get("image_directory", "")
+                self.move_destination = config.get("move_destination", "")
         else:
             self.image_directory = ""
+            self.move_destination = ""
 
     def save_config(self):
         with open(CONFIG_PATH, "w") as f:
-            json.dump({"image_directory": self.image_directory}, f)
+            json.dump({
+                "image_directory": self.image_directory,
+                "move_destination": self.move_destination,
+            }, f)
 
     def __init__(self):
         super().__init__()
@@ -316,6 +335,7 @@ class DragDropSorter(tk.Tk):
 
         tk.Button(self, text="Preview Rename", command=self.preview_order).pack(pady=2)
         tk.Button(self, text="Rename & Save Order", command=self.save_order).pack(pady=2)
+        tk.Button(self, text="Move & Rename To...", command=self.move_and_rename_to_folder).pack(pady=2)
         tk.Button(self, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
 
         self.loading_label = tk.Label(self, text="Click 'Load' to load thumbnails")
@@ -777,6 +797,98 @@ class DragDropSorter(tk.Tk):
             print(f"⚠️ Log save failed: {e}")
 
         self.redraw_grid()
+
+    def move_and_rename_to_folder(self):
+        if self.is_loading():
+            return
+        if not self.image_data:
+            messagebox.showinfo("Move & Rename", "No images loaded.")
+            return
+
+        prefix = self.prefix_entry.get().strip()
+        if prefix and not prefix.endswith("_"):
+            prefix += "_"
+
+        initial = self.move_destination if self.move_destination and os.path.isdir(self.move_destination) \
+            else (self.folder_entry.get().strip() or self.image_directory)
+        kwargs = {"initialdir": initial} if initial and os.path.isdir(initial) else {}
+        dest_dir = filedialog.askdirectory(title="Choose destination folder", **kwargs)
+        if not dest_dir:
+            return
+        if os.path.normpath(dest_dir) == os.path.normpath(self.image_directory):
+            messagebox.showerror("Move & Rename", "Destination must be a different folder.")
+            return
+
+        self.move_destination = dest_dir
+        self.save_config()
+
+        if not messagebox.askyesno(
+            "Confirm Move",
+            f"Move and rename {len(self.image_data)} file(s) to:\n{dest_dir}?"
+        ):
+            return
+
+        start_idx = find_next_index(dest_dir, prefix)
+        prefix_date = parse_date_from_prefix(prefix)
+        moved, log_entries = [], []
+
+        for offset, data in enumerate(self.image_data):
+            idx = start_idx + offset
+            old_path = os.path.join(self.image_directory, data["filename"])
+            ext = os.path.splitext(data["filename"])[1].lower()
+            final_name = f"{prefix}{idx:03d}{ext}"
+            final_path = os.path.join(dest_dir, final_name)
+
+            if os.path.exists(final_path):
+                overwrite = messagebox.askyesno(
+                    "Conflict Warning",
+                    f"File '{final_name}' already exists in destination.\nOverwrite?"
+                )
+                if not overwrite:
+                    continue
+
+            try:
+                shutil.move(old_path, final_path)
+            except Exception as e:
+                print(f"⚠️ Move failed for {data['filename']}: {e}")
+                continue
+
+            if prefix_date and ext in JPEG_EXTENSIONS:
+                try:
+                    set_jpeg_date_taken(final_path, prefix_date)
+                except Exception as e:
+                    print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
+
+            log_entries.append({
+                "original": data["filename"],
+                "final": final_name,
+                "destination": dest_dir,
+            })
+            moved.append(data)
+
+        for data in moved:
+            self.canvas.delete(data["item"])
+            data["label"].destroy()
+            self.image_data.remove(data)
+        self.redraw_grid()
+        self.set_on_disk_order()
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
+
+        if log_entries:
+            timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
+            log_name = f"move_log_{timestamp}.json"
+            log_path = os.path.join(self.image_directory, log_name)
+            try:
+                with open(log_path, "w") as f:
+                    json.dump({
+                        "timestamp": timestamp,
+                        "prefix": prefix,
+                        "destination": dest_dir,
+                        "files": log_entries
+                    }, f, indent=2)
+                print(f"📝 Move log saved: {log_name}")
+            except Exception as e:
+                print(f"⚠️ Log save failed: {e}")
 
     def restore_from_log(self):
         logs = [f for f in os.listdir(self.image_directory) if f.startswith("rename_log_") and f.endswith(".json")]

@@ -284,6 +284,7 @@ class DragDropSorter(tk.Tk):
         self._is_dragging = False
 
         self.load_config()
+        self.hide_hidden_files_in_dialogs()
 
         self.create_ui()
         self.folder_entry.insert(0, self.image_directory)
@@ -442,8 +443,22 @@ class DragDropSorter(tk.Tk):
             self.selected_widgets.clear()
             self.last_clicked_index = None
 
+    def hide_hidden_files_in_dialogs(self):
+        """Make Tk's own file/folder dialogs (used on X11) hide dotfiles, with a
+        "Show Hidden" checkbox to reveal them. The settings live in tkfbox.tcl,
+        which is only sourced when a dialog first opens -- and sourcing it resets
+        them -- so force it to load with a deliberately invalid call first."""
+        if self.tk.call("tk", "windowingsystem") != "x11":
+            return
+        try:
+            self.tk.call("tk_getOpenFile", "-badoption")
+        except tk.TclError:
+            pass
+        self.tk.call("set", "::tk::dialog::file::showHiddenBtn", 1)
+        self.tk.call("set", "::tk::dialog::file::showHiddenVar", 0)
+
     def start_thumbnail_loading(self):
-        entries = sorted(os.listdir(self.image_directory))
+        entries = sorted(e for e in os.listdir(self.image_directory) if not e.startswith("."))
         self.folder_names = [d for d in entries
                               if os.path.isdir(os.path.join(self.image_directory, d))]
         parent = os.path.dirname(self.image_directory.rstrip(os.sep))

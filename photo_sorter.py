@@ -1,8 +1,9 @@
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, IptcImagePlugin
 import os, json, threading, datetime, calendar, re, math, stat
+import xml.etree.ElementTree as ET
 from send2trash import send2trash
 import piexif
 
@@ -44,6 +45,51 @@ def set_jpeg_date_taken(path, date):
     finally:
         if not mode & stat.S_IWUSR:
             os.chmod(path, mode)
+
+
+XMP_NS = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+}
+
+
+def read_photo_metadata(path):
+    """Return (date_taken, keywords) for display. date_taken is a string or None.
+    Keywords come mainly from XMP dc:subject (what digiKam, Lightroom, darktable,
+    Windows "Tags" etc. read and filter on), merged with legacy IPTC Keywords and
+    Windows XPKeywords so tags written by older tools still show up."""
+    date_taken, keywords = None, []
+    with Image.open(path) as img:
+        exif = img.getexif()
+        raw_date = exif.get_ifd(0x8769).get(36867) or exif.get(306)  # DateTimeOriginal, DateTime
+        if raw_date:
+            date_part, _, time_part = str(raw_date).strip().partition(" ")
+            date_taken = date_part.replace(":", "-")
+            if time_part and time_part != "00:00:00":
+                date_taken += f" {time_part}"
+
+        xmp = img.info.get("xmp")
+        if xmp:
+            try:
+                root = ET.fromstring(xmp)
+                keywords += [li.text.strip() for li in root.iterfind(".//dc:subject//rdf:li", XMP_NS)
+                             if li.text and li.text.strip()]
+            except ET.ParseError:
+                pass
+
+        iptc = IptcImagePlugin.getiptcinfo(img) or {}
+        iptc_kw = iptc.get((2, 25), [])
+        for kw in iptc_kw if isinstance(iptc_kw, list) else [iptc_kw]:
+            keywords.append(kw.decode("utf-8", "replace").strip())
+
+        xp = exif.get(0x9C9E)  # XPKeywords: UTF-16LE, ';'-separated
+        if xp:
+            xp = bytes(xp).decode("utf-16-le", "replace").rstrip("\x00")
+            keywords += [k.strip() for k in xp.split(";") if k.strip()]
+
+    seen = set()
+    keywords = [k for k in keywords if k and not (k.lower() in seen or seen.add(k.lower()))]
+    return date_taken, keywords
 
 DATE_PATTERNS = [
     (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),
@@ -287,6 +333,9 @@ class DragDropSorter(tk.Tk):
         self.folder_names = []
         self.grid_row_offset = 0
         self.load_generation = 0
+        self.metadata_cache = {}  # path -> (mtime, (date_taken, keywords))
+        self.tooltip = None
+        self.tooltip_after = None
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
@@ -403,6 +452,7 @@ class DragDropSorter(tk.Tk):
         self.start_thumbnail_loading()
 
     def clear_grid(self):
+        self.hide_tooltip()
         self.canvas.delete("all")
         for widget in self.canvas.winfo_children():
             widget.destroy()
@@ -434,9 +484,11 @@ class DragDropSorter(tk.Tk):
         self.destroy()
 
     def on_mousewheel(self, event):
+        self.hide_tooltip()  # the grid moves under the pointer without a <Leave>
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def on_mousewheel_linux(self, event):
+        self.hide_tooltip()
         if event.num == 4:
             self.canvas.yview_scroll(-3, "units")
         elif event.num == 5:
@@ -533,6 +585,8 @@ class DragDropSorter(tk.Tk):
         lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
         lbl.bind("<B1-Motion>", lambda e, l=lbl: self.handle_drag_motion(e, l))
         lbl.bind("<ButtonRelease-1>", self.finish_drag)
+        lbl.bind("<Enter>", lambda e, l=lbl: self.schedule_tooltip(l))
+        lbl.bind("<Leave>", self.hide_tooltip)
 
         self.image_data.append({
             "filename": file,
@@ -606,7 +660,51 @@ class DragDropSorter(tk.Tk):
             self.drag_overlay.destroy()
             self.drag_overlay = None
 
+    def schedule_tooltip(self, label):
+        self.hide_tooltip()
+        if not self._is_dragging:
+            self.tooltip_after = self.after(500, self.show_tooltip, label)
+
+    def show_tooltip(self, label):
+        self.tooltip_after = None
+        data = next((d for d in self.image_data if d["label"] is label), None)
+        if data is None or not label.winfo_exists():
+            return
+        # Look up the filename now rather than at bind time: renames change it.
+        path = os.path.join(self.image_directory, data["filename"])
+        try:
+            mtime = os.stat(path).st_mtime
+            cached = self.metadata_cache.get(path)
+            if cached and cached[0] == mtime:
+                date_taken, keywords = cached[1]
+            else:
+                date_taken, keywords = read_photo_metadata(path)
+                self.metadata_cache[path] = (mtime, (date_taken, keywords))
+        except Exception as e:
+            date_taken, keywords = None, []
+            print(f"⚠️ Could not read metadata for {data['filename']}: {e}")
+
+        text = (f"{data['filename']}\n"
+                f"Date: {date_taken or '(none)'}\n"
+                f"Keywords: {', '.join(keywords) if keywords else '(none)'}")
+        self.tooltip = tk.Toplevel(self)
+        self.tooltip.overrideredirect(True)
+        self.tooltip.attributes("-topmost", True)
+        tk.Label(self.tooltip, text=text, justify="left", bg="#ffffe0", fg="black",
+                 bd=1, relief="solid", padx=6, pady=4, wraplength=320).pack()
+        x, y = self.winfo_pointerxy()
+        self.tooltip.geometry(f"+{x + 16}+{y + 16}")
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip_after:
+            self.after_cancel(self.tooltip_after)
+            self.tooltip_after = None
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
     def handle_click_and_drag(self, event, label, index):
+        self.hide_tooltip()
         if not hasattr(self, 'on_disk_order'):
             return
         self.dragged_widget = label

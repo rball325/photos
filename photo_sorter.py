@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk
-import os, json, threading, datetime, calendar, re
+import os, json, threading, datetime, calendar, re, math
 from send2trash import send2trash
 import piexif
 
@@ -173,6 +173,8 @@ class ImageViewer(tk.Toplevel):
         self._canvas.bind("<Button-5>", self._on_scroll_linux)
         self._canvas.bind("<ButtonPress-1>", self._on_pan_start)
         self._canvas.bind("<B1-Motion>", self._on_pan_move)
+        # Redraw on resize so newly exposed areas get filled; skipped until the first fit.
+        self._canvas.bind("<Configure>", lambda e: self._photo and self._redraw())
 
         self.after(100, self._fit_to_window)
 
@@ -188,15 +190,30 @@ class ImageViewer(tk.Toplevel):
         self._redraw()
 
     def _redraw(self):
+        # Only crop and scale the part of the image that's visible on the canvas.
+        # Scaling the whole image at high zoom produced bitmaps far beyond X11's
+        # 32767px limit (and many GB of RAM), freezing or crashing the app.
         self._canvas.delete("all")
-        iw, ih = self._image.size
-        new_w = max(1, int(iw * self._scale))
-        new_h = max(1, int(ih * self._scale))
-        resized = self._image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        self._photo = ImageTk.PhotoImage(resized)
-        self._canvas.create_image(int(self._offset[0]), int(self._offset[1]),
-                                   image=self._photo, anchor="center")
         self._zoom_var.set(f"{int(self._scale * 100)}%")
+        iw, ih = self._image.size
+        s = self._scale
+        cw, ch = self._canvas.winfo_width(), self._canvas.winfo_height()
+        left = self._offset[0] - iw * s / 2
+        top = self._offset[1] - ih * s / 2
+        # Visible region in source-image pixels, padded out to whole pixels.
+        sx0 = max(0, math.floor(-left / s))
+        sy0 = max(0, math.floor(-top / s))
+        sx1 = min(iw, math.ceil((cw - left) / s))
+        sy1 = min(ih, math.ceil((ch - top) / s))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return
+        out_w = max(1, round((sx1 - sx0) * s))
+        out_h = max(1, round((sy1 - sy0) * s))
+        resized = self._image.resize((out_w, out_h), Image.Resampling.LANCZOS,
+                                     box=(sx0, sy0, sx1, sy1))
+        self._photo = ImageTk.PhotoImage(resized)
+        self._canvas.create_image(round(left + sx0 * s), round(top + sy0 * s),
+                                  image=self._photo, anchor="nw")
 
     def _zoom_at(self, factor, cx, cy):
         old = self._scale

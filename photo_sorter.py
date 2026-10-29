@@ -277,6 +277,7 @@ class DragDropSorter(tk.Tk):
         self.folder_data = []
         self.folder_names = []
         self.grid_row_offset = 0
+        self.load_generation = 0
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
@@ -360,10 +361,10 @@ class DragDropSorter(tk.Tk):
         kwargs = {"initialdir": initial} if initial and os.path.isdir(initial) else {}
         selected_dir = filedialog.askdirectory(**kwargs)
         if selected_dir:
-            self.image_directory = selected_dir
+            # Only fill in the entry; Load switches image_directory. Changing it here
+            # would leave the grid showing the old folder's files under the new path.
             self.folder_entry.delete(0, tk.END)
             self.folder_entry.insert(0, selected_dir)
-            self.save_config()
 
     def load_from_entry(self):
         path = self.folder_entry.get()
@@ -455,7 +456,11 @@ class DragDropSorter(tk.Tk):
         if self.folder_names:
             self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
             self.add_folder_widgets()
-        threading.Thread(target=self.load_thumbnails_thread, daemon=True).start()
+        # Bump the generation so a loader still running for a previous folder stops,
+        # and any thumbnails it already queued via after() are discarded.
+        self.load_generation += 1
+        threading.Thread(target=self.load_thumbnails_thread, daemon=True,
+                         args=(self.load_generation, self.image_directory, self.image_files)).start()
 
     def add_folder_widgets(self):
         self.folder_data = []
@@ -471,9 +476,11 @@ class DragDropSorter(tk.Tk):
             self.folder_data.append({"name": name, "label": lbl})
         self.update_scrollregion()
 
-    def load_thumbnails_thread(self):
-        for idx, file in enumerate(self.image_files):
-            img_path = os.path.join(self.image_directory, file)
+    def load_thumbnails_thread(self, generation, directory, files):
+        for idx, file in enumerate(files):
+            if generation != self.load_generation:
+                return
+            img_path = os.path.join(directory, file)
             try:
                 img = Image.open(img_path)
                 img.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
@@ -482,13 +489,27 @@ class DragDropSorter(tk.Tk):
                 print(f"Failed to open file {file}: {e}")
                 continue
             try:
-                self.after(0, self.add_thumbnail_to_grid, file, img, idx)
+                self.after(0, self.add_thumbnail_to_grid, generation, file, img, idx)
             except Exception:
                 pass
-        self.after(0, lambda: self.set_on_disk_order())
-        self.after(0, lambda: self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded."))
+        self.after(0, self.finish_loading, generation)
 
-    def add_thumbnail_to_grid(self, file, img, idx):
+    def finish_loading(self, generation):
+        if generation != self.load_generation:
+            return
+        self.set_on_disk_order()
+        self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded.")
+
+    def is_loading(self):
+        # on_disk_order is only set once loading completes (see clear_grid / finish_loading).
+        if not self.load_generation or hasattr(self, 'on_disk_order'):
+            return False
+        messagebox.showinfo("Still Loading", "Wait for thumbnails to finish loading.")
+        return True
+
+    def add_thumbnail_to_grid(self, generation, file, img, idx):
+        if generation != self.load_generation:
+            return
         # PhotoImage must be created on the main thread (Tcl/Tk is not thread-safe),
         # so the background loader hands us a plain PIL Image to convert here.
         photo = ImageTk.PhotoImage(img)
@@ -692,6 +713,8 @@ class DragDropSorter(tk.Tk):
             self.save_order()
 
     def save_order(self):
+        if self.is_loading():
+            return
         prefix = self.prefix_entry.get().strip()
         if prefix and not prefix.endswith("_"):
             prefix += "_"

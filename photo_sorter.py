@@ -252,6 +252,7 @@ class DragDropSorter(tk.Tk):
         self.geometry("960x720")
         self.protocol("WM_DELETE_WINDOW", self.on_app_close)
         self.thumb_size = (120, 120)
+        self.cell_size = 140  # thumb + selection border + padding
         self.image_directory = ""
         self.max_columns = 6
         self.image_data = []
@@ -302,21 +303,20 @@ class DragDropSorter(tk.Tk):
         self.loading_label = tk.Label(self, text="Click 'Load' to load thumbnails")
         self.loading_label.pack(pady=5)
 
+        # Thumbnails are placed directly on the canvas as window items rather than
+        # gridded into one inner Frame: X11 caps window size at 32767px, and a Frame
+        # tall enough for ~1500 thumbnails made Tk abort with BadAlloc.
         self.canvas = tk.Canvas(self)
-        self.frame = tk.Frame(self.canvas)
         self.scrollbar = tk.Scrollbar(self, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.create_window((0, 0), window=self.frame, anchor='nw')
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.configure(yscrollincrement=10)
-        self.frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)       # Windows & macOS
         self.canvas.bind_all("<Button-4>", self.on_mousewheel_linux)   # Linux scroll up
         self.canvas.bind_all("<Button-5>", self.on_mousewheel_linux)   # Linux scroll down
         self.canvas.bind("<Button-1>", self.clear_selection_on_background)
-        self.frame.bind("<Button-1>", self.clear_selection_on_background)  # 👈 Add this
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
 
@@ -376,7 +376,8 @@ class DragDropSorter(tk.Tk):
         self.start_thumbnail_loading()
 
     def clear_grid(self):
-        for widget in self.frame.winfo_children():
+        self.canvas.delete("all")
+        for widget in self.canvas.winfo_children():
             widget.destroy()
         self.image_data.clear()
         self.folder_data = []
@@ -445,12 +446,13 @@ class DragDropSorter(tk.Tk):
             row = idx // self.max_columns
             column = idx % self.max_columns
             display = ".. (parent)" if name == ".." else name
-            lbl = tk.Label(self.frame, text=f"📁 {display}", width=14, height=6,
+            lbl = tk.Label(self.canvas, text=f"📁 {display}", width=14, height=6,
                            wraplength=100, justify="center",
                            bg="#dde8f5", bd=2, relief="raised")
-            lbl.grid(row=row, column=column, padx=5, pady=5)
+            self.canvas.create_window(*self.cell_center(row, column), window=lbl)
             lbl.bind("<Button-1>", lambda e, n=name: self.navigate_to_folder(n))
             self.folder_data.append({"name": name, "label": lbl})
+        self.update_scrollregion()
 
     def load_thumbnails_thread(self):
         for idx, file in enumerate(self.image_files):
@@ -476,9 +478,9 @@ class DragDropSorter(tk.Tk):
         position = len(self.image_data)
         row = self.grid_row_offset + position // self.max_columns
         column = position % self.max_columns
-        lbl = tk.Label(self.frame, image=photo, bd=2, relief="raised")
+        lbl = tk.Label(self.canvas, image=photo, bd=2, relief="raised")
         lbl.image = photo
-        lbl.grid(row=row, column=column, padx=5, pady=5)
+        item = self.canvas.create_window(*self.cell_center(row, column), window=lbl)
 
         lbl.bind("<Button-1>", lambda e, l=lbl, i=idx: self.handle_click_and_drag(e, l, i))
         lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
@@ -489,9 +491,11 @@ class DragDropSorter(tk.Tk):
             "filename": file,
             "photo": photo,
             "label": lbl,
+            "item": item,
             "row": row,
             "column": column
         })
+        self.update_scrollregion()
         self.loading_label.config(text=f"Loading {len(self.image_data)} of {self.total_files}...")
 
     def open_image_viewer(self, filename):
@@ -515,6 +519,7 @@ class DragDropSorter(tk.Tk):
             except Exception as e:
                 print(f"⚠️ Could not delete {path}: {e}")
                 continue
+            self.canvas.delete(data["item"])
             data["label"].destroy()
             self.image_data.remove(data)
 
@@ -607,17 +612,17 @@ class DragDropSorter(tk.Tk):
     def finish_drag(self, event):
         self.canvas.unbind("<Motion>")
         self.destroy_drag_cursor(event)
-        x = event.x_root - self.frame.winfo_rootx()
-        y = event.y_root - self.frame.winfo_rooty()
+        # Hit-test against the fixed cell layout in canvas coordinates; widget
+        # winfo_x/y aren't kept current for items scrolled out of view.
+        x = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
+        y = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
         target = None
-        for data in self.image_data:
-            lbl = data["label"]
-            if lbl == self.dragged_widget:
-                continue
-            if lbl.winfo_x() <= x <= lbl.winfo_x() + lbl.winfo_width() and \
-               lbl.winfo_y() <= y <= lbl.winfo_y() + lbl.winfo_height():
+        column = int(x // self.cell_size)
+        position = (int(y // self.cell_size) - self.grid_row_offset) * self.max_columns + column
+        if 0 <= column < self.max_columns and 0 <= position < len(self.image_data):
+            lbl = self.image_data[position]["label"]
+            if lbl != self.dragged_widget:
                 target = lbl
-                break
         if self.selected_widgets:
             group = [d for d in self.image_data if d["label"] in self.selected_widgets]
             remaining = [d for d in self.image_data if d["label"] not in self.selected_widgets]
@@ -636,17 +641,25 @@ class DragDropSorter(tk.Tk):
         self.dragged_widget = label
         pass
 
+    def cell_center(self, row, column):
+        half = self.cell_size / 2
+        return column * self.cell_size + half, row * self.cell_size + half
+
+    def update_scrollregion(self):
+        rows = self.grid_row_offset + (len(self.image_data) + self.max_columns - 1) // self.max_columns
+        self.canvas.configure(scrollregion=(0, 0, self.max_columns * self.cell_size, rows * self.cell_size))
+
     def redraw_grid(self):
         row = self.grid_row_offset
         column = 0
         for data in self.image_data:
-            lbl = data["label"]
-            lbl.grid(row=row, column=column, padx=5, pady=5)
+            self.canvas.coords(data["item"], *self.cell_center(row, column))
             data["row"], data["column"] = row, column
             column += 1
             if column >= self.max_columns:
                 column = 0
                 row += 1
+        self.update_scrollregion()
 
     def preview_order(self):
         prefix = self.prefix_entry.get().strip()

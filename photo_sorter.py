@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk
-import os, json, threading, datetime, calendar, re, math
+import os, json, threading, datetime, calendar, re, math, stat
 from send2trash import send2trash
 import piexif
 
@@ -34,7 +34,16 @@ def set_jpeg_date_taken(path, date):
     exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_date
     exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
     exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_date
-    piexif.insert(piexif.dump(exif_dict), path)
+    # Photos are often kept read-only; lift that just long enough to write the
+    # EXIF segment, then put the original permissions back.
+    mode = os.stat(path).st_mode
+    if not mode & stat.S_IWUSR:
+        os.chmod(path, mode | stat.S_IWUSR)
+    try:
+        piexif.insert(piexif.dump(exif_dict), path)
+    finally:
+        if not mode & stat.S_IWUSR:
+            os.chmod(path, mode)
 
 DATE_PATTERNS = [
     (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),

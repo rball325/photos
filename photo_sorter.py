@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
-from PIL import Image, ImageTk, IptcImagePlugin
+from PIL import Image, ImageTk, ImageOps, IptcImagePlugin
 import os, json, threading, datetime, calendar, re, shutil, math, stat
 import xml.etree.ElementTree as ET
 from send2trash import send2trash
@@ -28,13 +28,35 @@ def set_jpeg_date_taken(path, date):
     """Write date into JPEG EXIF date tags by editing only the EXIF segment
     in place -- the compressed image data is never touched/re-encoded."""
     exif_date = date.strftime("%Y:%m:%d 00:00:00")
-    try:
-        exif_dict = piexif.load(path)
-    except Exception:
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    exif_dict = load_exif(path)
     exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_date
     exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
     exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_date
+    write_exif(path, exif_dict)
+
+
+# EXIF Orientation value that shows the image turned a further 90° clockwise.
+ROTATE_CW = {1: 6, 6: 3, 3: 8, 8: 1, 2: 7, 7: 4, 4: 5, 5: 2}
+
+
+def rotate_jpeg_cw(path):
+    """Rotate a JPEG 90° clockwise by updating its EXIF Orientation tag, so the
+    compressed image data is never re-encoded."""
+    exif_dict = load_exif(path)
+    current = exif_dict["0th"].get(piexif.ImageIFD.Orientation, 1)
+    exif_dict["0th"][piexif.ImageIFD.Orientation] = ROTATE_CW.get(current, 6)
+    write_exif(path, exif_dict)
+
+
+def load_exif(path):
+    try:
+        return piexif.load(path)
+    except Exception:
+        return {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+
+def write_exif(path, exif_dict):
+    """Replace only the EXIF segment of a JPEG in place."""
     # Photos are often kept read-only; lift that just long enough to write the
     # EXIF segment, then put the original permissions back.
     mode = os.stat(path).st_mode
@@ -220,7 +242,7 @@ class ImageViewer(tk.Toplevel):
         super().__init__(master)
         self.title(os.path.basename(image_path))
         self.geometry("800x600")
-        self._image = Image.open(image_path)
+        self._image = ImageOps.exif_transpose(Image.open(image_path))
         self._scale = 1.0
         self._offset = [0.0, 0.0]
         self._drag_start = None
@@ -416,6 +438,7 @@ class DragDropSorter(tk.Tk):
         self.canvas.bind("<Button-1>", self.clear_selection_on_background)
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
+        self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
 
     def choose_date_prefix(self):
         dialog = DatePickerDialog(self)
@@ -516,6 +539,7 @@ class DragDropSorter(tk.Tk):
             self.canvas.yview_scroll(3, "units")
 
     def clear_selection_on_background(self, event):
+        self.canvas.focus_set()  # take focus from the entries so keys reach the grid
         widget = self.winfo_containing(event.x_root, event.y_root)
         # If not one of the image thumbnails, clear selection
         if widget not in [d["label"] for d in self.image_data]:
@@ -578,9 +602,7 @@ class DragDropSorter(tk.Tk):
                 return
             img_path = os.path.join(directory, file)
             try:
-                img = Image.open(img_path)
-                img.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
-                img.load()
+                img = self.make_thumbnail(img_path)
             except Exception as e:
                 print(f"Failed to open file {file}: {e}")
                 continue
@@ -589,6 +611,12 @@ class DragDropSorter(tk.Tk):
             except Exception:
                 pass
         self.after(0, self.finish_loading, generation)
+
+    def make_thumbnail(self, path):
+        img = Image.open(path)
+        img.thumbnail(self.thumb_size, Image.Resampling.LANCZOS)
+        # Turn the thumbnail upright per its EXIF Orientation, as other viewers do.
+        return ImageOps.exif_transpose(img)
 
     def finish_loading(self, generation):
         if generation != self.load_generation:
@@ -738,7 +766,32 @@ class DragDropSorter(tk.Tk):
             self.tooltip.destroy()
             self.tooltip = None
 
+    def rotate_thumbnail_under_cursor(self, event):
+        if isinstance(event.widget, tk.Entry):
+            return  # typing an 'r' into the prefix or folder field
+        widget = self.winfo_containing(*self.winfo_pointerxy())
+        data = next((d for d in self.image_data if d["label"] is widget), None)
+        if data is None:
+            return
+        path = os.path.join(self.image_directory, data["filename"])
+        if not data["filename"].lower().endswith(JPEG_EXTENSIONS):
+            self.loading_label.config(text=f"⚠️ Can only rotate JPEGs: {data['filename']}")
+            return
+        try:
+            rotate_jpeg_cw(path)
+            img = self.make_thumbnail(path)
+        except Exception as e:
+            print(f"⚠️ Could not rotate {data['filename']}: {e}")
+            self.loading_label.config(text=f"⚠️ Could not rotate {data['filename']}: {e}")
+            return
+        photo = ImageTk.PhotoImage(img)
+        data["label"].config(image=photo)
+        data["label"].image = photo
+        data["photo"] = photo
+        self.loading_label.config(text=f"↻ Rotated {data['filename']}")
+
     def handle_click_and_drag(self, event, label, index):
+        self.canvas.focus_set()  # take focus from the entries so keys reach the grid
         self.hide_tooltip()
         if not hasattr(self, 'on_disk_order'):
             return

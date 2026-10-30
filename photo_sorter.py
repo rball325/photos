@@ -993,6 +993,10 @@ class DragDropSorter(tk.Tk):
         if not self.image_data:
             messagebox.showinfo("Move & Rename", "No images loaded.")
             return
+        # Move just the selection when there is one (in grid order), else everything.
+        to_move = [d for d in self.image_data if d["label"] in self.selected_widgets] \
+            or list(self.image_data)
+        which = "selected " if len(to_move) < len(self.image_data) else ""
 
         prefix = self.prefix_entry.get().strip()
         if prefix and not prefix.endswith("_"):
@@ -1013,7 +1017,7 @@ class DragDropSorter(tk.Tk):
 
         if not messagebox.askyesno(
             "Confirm Move",
-            f"Move and rename {len(self.image_data)} file(s) to:\n{dest_dir}?"
+            f"Move and rename {len(to_move)} {which}file(s) to:\n{dest_dir}?"
         ):
             return
 
@@ -1021,7 +1025,7 @@ class DragDropSorter(tk.Tk):
         prefix_date = parse_date_from_prefix(prefix)
         moved, log_entries = [], []
 
-        for offset, data in enumerate(self.image_data):
+        for offset, data in enumerate(to_move):
             idx = start_idx + offset
             old_path = os.path.join(self.image_directory, data["filename"])
             ext = os.path.splitext(data["filename"])[1].lower()
@@ -1059,8 +1063,14 @@ class DragDropSorter(tk.Tk):
             self.canvas.delete(data["item"])
             data["label"].destroy()
             self.image_data.remove(data)
+            if data["label"] in self.selected_widgets:
+                self.selected_widgets.remove(data["label"])
+        self.last_clicked_index = None
         self.redraw_grid()
-        self.set_on_disk_order()
+        # Drop the moved files from the saved order without marking any unsaved
+        # reordering of the files left behind as saved.
+        moved_names = {d["filename"] for d in moved}
+        self.on_disk_order = [f for f in self.on_disk_order if f not in moved_names]
         self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
 
         if log_entries:

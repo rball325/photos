@@ -439,6 +439,10 @@ class DragDropSorter(tk.Tk):
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
         self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
+        self.bind_all("<Home>", lambda e: self.scroll_grid_to(e, 0.0))
+        self.bind_all("<End>", lambda e: self.scroll_grid_to(e, 1.0))
+        self.bind_all("<Prior>", lambda e: self.scroll_grid_page(-1))
+        self.bind_all("<Next>", lambda e: self.scroll_grid_page(1))
 
     def choose_date_prefix(self):
         dialog = DatePickerDialog(self)
@@ -537,6 +541,16 @@ class DragDropSorter(tk.Tk):
             self.canvas.yview_scroll(-3, "units")
         elif event.num == 5:
             self.canvas.yview_scroll(3, "units")
+
+    def scroll_grid_to(self, event, fraction):
+        if isinstance(event.widget, tk.Entry):
+            return  # Home/End move the cursor in the prefix or folder field
+        self.hide_tooltip()
+        self.canvas.yview_moveto(fraction)
+
+    def scroll_grid_page(self, direction):
+        self.hide_tooltip()
+        self.canvas.yview_scroll(direction, "pages")
 
     def clear_selection_on_background(self, event):
         self.canvas.focus_set()  # take focus from the entries so keys reach the grid

@@ -1013,36 +1013,74 @@ class DragDropSorter(tk.Tk):
                 print(f"⚠️ Log save failed: {e}")
 
     def restore_from_log(self):
-        logs = [f for f in os.listdir(self.image_directory) if f.startswith("rename_log_") and f.endswith(".json")]
-        if not logs:
-            messagebox.showerror("Restore Error", "No rename logs found.")
+        """Undo the most recent rename or move made from this folder, using its log."""
+        if self.is_loading():
             return
-        logs.sort(reverse=True)
-        log_path = os.path.join(self.image_directory, logs[0])
+        logs = [f for f in os.listdir(self.image_directory)
+                if f.startswith(("rename_log_", "move_log_")) and f.endswith(".json")]
+        if not logs:
+            messagebox.showerror("Restore Error", "No rename or move logs found.")
+            return
+        # Both log types share the timestamp suffix, so order by that, not by prefix;
+        # the timestamp only has 1s resolution, so break ties by file mtime.
+        log_name = max(logs, key=lambda f: (f.split("_log_", 1)[1],
+                                            os.path.getmtime(os.path.join(self.image_directory, f))))
+        log_path = os.path.join(self.image_directory, log_name)
         try:
             with open(log_path, "r") as f:
                 log = json.load(f)
         except Exception:
-            messagebox.showerror("Error", f"Could not read {logs[0]}")
+            messagebox.showerror("Error", f"Could not read {log_name}")
             return
-        if not messagebox.askyesno("Confirm Restore", f"Restore original filenames from {logs[0]}?"):
+
+        entries = log.get("files", [])
+        is_move = log_name.startswith("move_log_")
+        if is_move:
+            prompt = (f"Move {len(entries)} file(s) back from:\n{log.get('destination', '')}\n"
+                      f"and restore their original names?\n\n({log_name})")
+        else:
+            prompt = f"Restore original filenames from {log_name}?"
+        if not messagebox.askyesno("Confirm Restore", prompt):
             return
 
         restored = 0
-        for entry in log.get("files", []):
-            final = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
+        for entry in entries:
+            if is_move:
+                current = os.path.join(entry.get("destination", log.get("destination", "")), entry["final"])
+            else:
+                current = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
             original = os.path.join(self.image_directory, entry["original"])
-            if os.path.exists(original) and final != original:
+            if not os.path.exists(current) and os.path.exists(original):
+                restored += 1  # already put back by an earlier, partial restore
+                continue
+            if os.path.exists(original) and current != original:
                 overwrite = messagebox.askyesno("Conflict Warning",
                     f"File '{entry['original']}' already exists.\nOverwrite?")
                 if not overwrite:
                     continue
             try:
-                os.rename(final, original)
+                shutil.move(current, original) if is_move else os.rename(current, original)
                 restored += 1
             except Exception as e:
-                print(f"⚠️ Could not restore {entry['final']}: {e}")
-        messagebox.showinfo("Restore Complete", f"Restored {restored} files from {logs[0]}")
+                print(f"⚠️ Could not restore {os.path.basename(current)}: {e}")
+
+        # Retire a fully-restored log so it isn't offered again: once a move is undone,
+        # later moves reuse those destination names, and replaying the old log would
+        # pull the new files back. A partial restore keeps the log so it can be retried.
+        if restored == len(entries):
+            retired, n = f"restored_{log_name}", 1
+            while os.path.exists(os.path.join(self.image_directory, retired)):
+                n += 1
+                retired = f"restored{n}_{log_name}"
+            try:
+                os.rename(log_path, os.path.join(self.image_directory, retired))
+            except Exception as e:
+                print(f"⚠️ Could not retire {log_name}: {e}")
+            messagebox.showinfo("Restore Complete", f"Restored {restored} files from {log_name}")
+        else:
+            messagebox.showwarning("Restore Incomplete",
+                f"Restored {restored} of {len(entries)} files from {log_name}.\n"
+                "The log was kept so the rest can be retried.")
         self.clear_grid()
         self.start_thumbnail_loading()
 

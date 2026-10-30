@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk, IptcImagePlugin
-import os, json, threading, datetime, calendar, re, math, stat
+import os, json, threading, datetime, calendar, re, shutil, math, stat
 import xml.etree.ElementTree as ET
 from send2trash import send2trash
 import piexif
@@ -90,6 +90,20 @@ def read_photo_metadata(path):
     seen = set()
     keywords = [k for k in keywords if k and not (k.lower() in seen or seen.add(k.lower()))]
     return date_taken, keywords
+
+
+def find_next_index(directory, prefix):
+    """Scan an existing directory for files already named <prefix><digits><ext>
+    and return the next unused index, so a batch moved there won't collide."""
+    pattern = re.compile(r'^' + re.escape(prefix) + r'(\d+)\.[^.]+$', re.IGNORECASE)
+    max_idx = 0
+    if os.path.isdir(directory):
+        for f in os.listdir(directory):
+            match = pattern.match(f)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+    return max_idx + 1
+
 
 DATE_PATTERNS = [
     (re.compile(r'\b(\d{4})[-_](\d{2})[-_](\d{2})\b'), 'ymd'),
@@ -311,12 +325,17 @@ class DragDropSorter(tk.Tk):
             with open(CONFIG_PATH, "r") as f:
                 config = json.load(f)
                 self.image_directory = config.get("image_directory", "")
+                self.move_destination = config.get("move_destination", "")
         else:
             self.image_directory = ""
+            self.move_destination = ""
 
     def save_config(self):
         with open(CONFIG_PATH, "w") as f:
-            json.dump({"image_directory": self.image_directory}, f)
+            json.dump({
+                "image_directory": self.image_directory,
+                "move_destination": self.move_destination,
+            }, f)
 
     def __init__(self):
         super().__init__()
@@ -375,6 +394,7 @@ class DragDropSorter(tk.Tk):
 
         tk.Button(self, text="Preview Rename", command=self.preview_order).pack(pady=2)
         tk.Button(self, text="Rename & Save Order", command=self.save_order).pack(pady=2)
+        tk.Button(self, text="Move & Rename To...", command=self.move_and_rename_to_folder).pack(pady=2)
         tk.Button(self, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
 
         self.loading_label = tk.Label(self, text="Click 'Load' to load thumbnails")
@@ -900,37 +920,167 @@ class DragDropSorter(tk.Tk):
 
         self.redraw_grid()
 
-    def restore_from_log(self):
-        logs = [f for f in os.listdir(self.image_directory) if f.startswith("rename_log_") and f.endswith(".json")]
-        if not logs:
-            messagebox.showerror("Restore Error", "No rename logs found.")
+    def move_and_rename_to_folder(self):
+        if self.is_loading():
             return
-        logs.sort(reverse=True)
-        log_path = os.path.join(self.image_directory, logs[0])
+        if not self.image_data:
+            messagebox.showinfo("Move & Rename", "No images loaded.")
+            return
+
+        prefix = self.prefix_entry.get().strip()
+        if prefix and not prefix.endswith("_"):
+            prefix += "_"
+
+        initial = self.move_destination if self.move_destination and os.path.isdir(self.move_destination) \
+            else (self.folder_entry.get().strip() or self.image_directory)
+        kwargs = {"initialdir": initial} if initial and os.path.isdir(initial) else {}
+        dest_dir = filedialog.askdirectory(title="Choose destination folder", **kwargs)
+        if not dest_dir:
+            return
+        if os.path.normpath(dest_dir) == os.path.normpath(self.image_directory):
+            messagebox.showerror("Move & Rename", "Destination must be a different folder.")
+            return
+
+        self.move_destination = dest_dir
+        self.save_config()
+
+        if not messagebox.askyesno(
+            "Confirm Move",
+            f"Move and rename {len(self.image_data)} file(s) to:\n{dest_dir}?"
+        ):
+            return
+
+        start_idx = find_next_index(dest_dir, prefix)
+        prefix_date = parse_date_from_prefix(prefix)
+        moved, log_entries = [], []
+
+        for offset, data in enumerate(self.image_data):
+            idx = start_idx + offset
+            old_path = os.path.join(self.image_directory, data["filename"])
+            ext = os.path.splitext(data["filename"])[1].lower()
+            final_name = f"{prefix}{idx:03d}{ext}"
+            final_path = os.path.join(dest_dir, final_name)
+
+            if os.path.exists(final_path):
+                overwrite = messagebox.askyesno(
+                    "Conflict Warning",
+                    f"File '{final_name}' already exists in destination.\nOverwrite?"
+                )
+                if not overwrite:
+                    continue
+
+            try:
+                shutil.move(old_path, final_path)
+            except Exception as e:
+                print(f"⚠️ Move failed for {data['filename']}: {e}")
+                continue
+
+            if prefix_date and ext in JPEG_EXTENSIONS:
+                try:
+                    set_jpeg_date_taken(final_path, prefix_date)
+                except Exception as e:
+                    print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
+
+            log_entries.append({
+                "original": data["filename"],
+                "final": final_name,
+                "destination": dest_dir,
+            })
+            moved.append(data)
+
+        for data in moved:
+            self.canvas.delete(data["item"])
+            data["label"].destroy()
+            self.image_data.remove(data)
+        self.redraw_grid()
+        self.set_on_disk_order()
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
+
+        if log_entries:
+            timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
+            log_name = f"move_log_{timestamp}.json"
+            log_path = os.path.join(self.image_directory, log_name)
+            try:
+                with open(log_path, "w") as f:
+                    json.dump({
+                        "timestamp": timestamp,
+                        "prefix": prefix,
+                        "destination": dest_dir,
+                        "files": log_entries
+                    }, f, indent=2)
+                print(f"📝 Move log saved: {log_name}")
+            except Exception as e:
+                print(f"⚠️ Log save failed: {e}")
+
+    def restore_from_log(self):
+        """Undo the most recent rename or move made from this folder, using its log."""
+        if self.is_loading():
+            return
+        logs = [f for f in os.listdir(self.image_directory)
+                if f.startswith(("rename_log_", "move_log_")) and f.endswith(".json")]
+        if not logs:
+            messagebox.showerror("Restore Error", "No rename or move logs found.")
+            return
+        # Both log types share the timestamp suffix, so order by that, not by prefix;
+        # the timestamp only has 1s resolution, so break ties by file mtime.
+        log_name = max(logs, key=lambda f: (f.split("_log_", 1)[1],
+                                            os.path.getmtime(os.path.join(self.image_directory, f))))
+        log_path = os.path.join(self.image_directory, log_name)
         try:
             with open(log_path, "r") as f:
                 log = json.load(f)
         except Exception:
-            messagebox.showerror("Error", f"Could not read {logs[0]}")
+            messagebox.showerror("Error", f"Could not read {log_name}")
             return
-        if not messagebox.askyesno("Confirm Restore", f"Restore original filenames from {logs[0]}?"):
+
+        entries = log.get("files", [])
+        is_move = log_name.startswith("move_log_")
+        if is_move:
+            prompt = (f"Move {len(entries)} file(s) back from:\n{log.get('destination', '')}\n"
+                      f"and restore their original names?\n\n({log_name})")
+        else:
+            prompt = f"Restore original filenames from {log_name}?"
+        if not messagebox.askyesno("Confirm Restore", prompt):
             return
 
         restored = 0
-        for entry in log.get("files", []):
-            final = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
+        for entry in entries:
+            if is_move:
+                current = os.path.join(entry.get("destination", log.get("destination", "")), entry["final"])
+            else:
+                current = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
             original = os.path.join(self.image_directory, entry["original"])
-            if os.path.exists(original) and final != original:
+            if not os.path.exists(current) and os.path.exists(original):
+                restored += 1  # already put back by an earlier, partial restore
+                continue
+            if os.path.exists(original) and current != original:
                 overwrite = messagebox.askyesno("Conflict Warning",
                     f"File '{entry['original']}' already exists.\nOverwrite?")
                 if not overwrite:
                     continue
             try:
-                os.rename(final, original)
+                shutil.move(current, original) if is_move else os.rename(current, original)
                 restored += 1
             except Exception as e:
-                print(f"⚠️ Could not restore {entry['final']}: {e}")
-        messagebox.showinfo("Restore Complete", f"Restored {restored} files from {logs[0]}")
+                print(f"⚠️ Could not restore {os.path.basename(current)}: {e}")
+
+        # Retire a fully-restored log so it isn't offered again: once a move is undone,
+        # later moves reuse those destination names, and replaying the old log would
+        # pull the new files back. A partial restore keeps the log so it can be retried.
+        if restored == len(entries):
+            retired, n = f"restored_{log_name}", 1
+            while os.path.exists(os.path.join(self.image_directory, retired)):
+                n += 1
+                retired = f"restored{n}_{log_name}"
+            try:
+                os.rename(log_path, os.path.join(self.image_directory, retired))
+            except Exception as e:
+                print(f"⚠️ Could not retire {log_name}: {e}")
+            messagebox.showinfo("Restore Complete", f"Restored {restored} files from {log_name}")
+        else:
+            messagebox.showwarning("Restore Incomplete",
+                f"Restored {restored} of {len(entries)} files from {log_name}.\n"
+                "The log was kept so the rest can be retried.")
         self.clear_grid()
         self.start_thumbnail_loading()
 

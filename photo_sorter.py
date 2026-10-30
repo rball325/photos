@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
-from PIL import Image, ImageTk, ImageOps, IptcImagePlugin
+from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
 import os, json, threading, datetime, calendar, re, shutil, math, stat
 import xml.etree.ElementTree as ET
 from send2trash import send2trash
@@ -67,6 +67,82 @@ def write_exif(path, exif_dict):
     finally:
         if not mode & stat.S_IWUSR:
             os.chmod(path, mode)
+
+
+THUMB_DIR = ".thumbs"
+_thumb_cache_warned = set()  # folders whose cache couldn't be written, so we warn once
+
+
+def thumb_cache_path(path):
+    """Cached thumbnail for path: a hidden .thumbs folder beside it, named thumb_<file>."""
+    directory, name = os.path.split(path)
+    return os.path.join(directory, THUMB_DIR, "thumb_" + name)
+
+
+def source_key(path):
+    """Size and modification time of the photo, stored in its cached thumbnail so
+    any edit (a rotation, an EXIF date) or a different file under the same name
+    is noticed and the thumbnail rebuilt."""
+    st = os.stat(path)
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def read_cached_thumb(path, key):
+    try:
+        with Image.open(thumb_cache_path(path)) as img:
+            stored = img.info.get("comment") or img.info.get("source")
+            if isinstance(stored, bytes):
+                stored = stored.decode("ascii", "replace")
+            if stored != key:
+                return None
+            img.load()
+            return img
+    except Exception:
+        return None
+
+
+def write_cached_thumb(path, img, key):
+    cache = thumb_cache_path(path)
+    tmp = f"{cache}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        if path.lower().endswith(".png"):
+            info = PngImagePlugin.PngInfo()
+            info.add_text("source", key)
+            img.save(tmp, "PNG", pnginfo=info)
+        else:
+            rgb = img if img.mode in ("RGB", "L") else img.convert("RGB")
+            rgb.save(tmp, "JPEG", quality=85, comment=key)
+        os.replace(tmp, cache)
+    except OSError as e:
+        directory = os.path.dirname(path)
+        if directory not in _thumb_cache_warned:
+            _thumb_cache_warned.add(directory)
+            print(f"⚠️ Could not cache thumbnails in {directory}: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def move_cached_thumb(old_path, new_path):
+    """Carry a cached thumbnail along when its photo is renamed or moved."""
+    old_cache = thumb_cache_path(old_path)
+    if not os.path.exists(old_cache):
+        return
+    try:
+        new_cache = thumb_cache_path(new_path)
+        os.makedirs(os.path.dirname(new_cache), exist_ok=True)
+        shutil.move(old_cache, new_cache)
+    except OSError as e:
+        print(f"⚠️ Could not move cached thumbnail {old_cache}: {e}")
+
+
+def remove_cached_thumb(path):
+    try:
+        os.remove(thumb_cache_path(path))
+    except OSError:
+        pass
 
 
 XMP_NS = {
@@ -616,7 +692,7 @@ class DragDropSorter(tk.Tk):
                 return
             img_path = os.path.join(directory, file)
             try:
-                img = self.make_thumbnail(img_path)
+                img = self.load_thumbnail(img_path)
             except Exception as e:
                 print(f"Failed to open file {file}: {e}")
                 continue
@@ -625,6 +701,15 @@ class DragDropSorter(tk.Tk):
             except Exception:
                 pass
         self.after(0, self.finish_loading, generation)
+
+    def load_thumbnail(self, path):
+        # Read the key before the photo so an edit made while we work leaves the cache stale.
+        key = source_key(path)
+        img = read_cached_thumb(path, key)
+        if img is None:
+            img = self.make_thumbnail(path)
+            write_cached_thumb(path, img, key)
+        return img
 
     def make_thumbnail(self, path):
         img = Image.open(path)
@@ -693,6 +778,7 @@ class DragDropSorter(tk.Tk):
             path = os.path.join(self.image_directory, data["filename"])
             try:
                 send2trash(path)
+                remove_cached_thumb(path)
                 print(f"🗑️ Deleted {path}")
             except Exception as e:
                 print(f"⚠️ Could not delete {path}: {e}")
@@ -793,7 +879,7 @@ class DragDropSorter(tk.Tk):
             return
         try:
             rotate_jpeg_cw(path)
-            img = self.make_thumbnail(path)
+            img = self.load_thumbnail(path)
         except Exception as e:
             print(f"⚠️ Could not rotate {data['filename']}: {e}")
             self.loading_label.config(text=f"⚠️ Could not rotate {data['filename']}: {e}")
@@ -937,6 +1023,7 @@ class DragDropSorter(tk.Tk):
             temp_path = os.path.join(self.image_directory, temp_name)
             try:
                 os.rename(old_path, temp_path)
+                move_cached_thumb(old_path, temp_path)
             except Exception as e:
                 print(f"⚠️ Rename failed: {e}")
                 continue
@@ -954,6 +1041,7 @@ class DragDropSorter(tk.Tk):
                     continue
             try:
                 os.rename(temp_path, final_path)
+                move_cached_thumb(temp_path, final_path)
             except Exception as e:
                 print(f"⚠️ Final rename failed: {e}")
                 continue
@@ -1042,6 +1130,7 @@ class DragDropSorter(tk.Tk):
 
             try:
                 shutil.move(old_path, final_path)
+                move_cached_thumb(old_path, final_path)
             except Exception as e:
                 print(f"⚠️ Move failed for {data['filename']}: {e}")
                 continue
@@ -1137,6 +1226,7 @@ class DragDropSorter(tk.Tk):
                     continue
             try:
                 shutil.move(current, original) if is_move else os.rename(current, original)
+                move_cached_thumb(current, original)
                 restored += 1
             except Exception as e:
                 print(f"⚠️ Could not restore {os.path.basename(current)}: {e}")

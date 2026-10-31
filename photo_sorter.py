@@ -24,6 +24,15 @@ def parse_date_from_prefix(prefix):
         return None
 
 
+def replace_prefix_date(prefix, date):
+    """Put date at the front of prefix, replacing a leading YYYY-MM-DD if there is
+    one and keeping whatever follows it (e.g. "1975-12-25_family" -> "<date>_family")."""
+    prefix = prefix.strip()
+    match = re.match(r'\d{4}-\d{2}-\d{2}(?=_|$)', prefix)
+    rest = prefix[match.end():] if match else ("_" + prefix if prefix else "")
+    return date.strftime("%Y-%m-%d") + (rest or "_")
+
+
 def set_jpeg_date_taken(path, date):
     """Write date into JPEG EXIF date tags by editing only the EXIF segment
     in place -- the compressed image data is never touched/re-encoded."""
@@ -243,6 +252,7 @@ class DatePickerDialog(tk.Toplevel):
         self.title("Choose Date")
         self.resizable(False, False)
         self.result = None
+        self._initial = initial
         self._date = (initial or datetime.date.today()).replace(day=1)
 
         entry_frame = tk.Frame(self)
@@ -305,7 +315,10 @@ class DatePickerDialog(tk.Toplevel):
                 if day == 0:
                     tk.Label(self.cal_frame, text="", width=3).grid(row=row, column=col)
                 else:
+                    current = self._date.replace(day=day) == self._initial
                     tk.Button(self.cal_frame, text=str(day), width=3,
+                              relief="sunken" if current else "raised",
+                              bg="#cde" if current else None,
                               command=lambda d=day: self._pick_day(d)).grid(row=row, column=col)
 
     def _pick_day(self, day):
@@ -521,11 +534,16 @@ class DragDropSorter(tk.Tk):
         self.bind_all("<Next>", lambda e: self.scroll_grid_page(1))
 
     def choose_date_prefix(self):
-        dialog = DatePickerDialog(self)
+        # Open on the date already in the prefix field, if there is one.
+        prefix = self.prefix_entry.get().strip()
+        if prefix and not prefix.endswith("_"):
+            prefix += "_"
+        dialog = DatePickerDialog(self, initial=parse_date_from_prefix(prefix))
         self.wait_window(dialog)
         if dialog.result:
+            new_prefix = replace_prefix_date(self.prefix_entry.get(), dialog.result)
             self.prefix_entry.delete(0, tk.END)
-            self.prefix_entry.insert(0, dialog.result.strftime("%Y-%m-%d") + "_")
+            self.prefix_entry.insert(0, new_prefix)
 
     def auto_set_prefix(self):
         if not self.image_directory:

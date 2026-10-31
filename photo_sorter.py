@@ -1087,6 +1087,13 @@ class DragDropSorter(tk.Tk):
         which = "selected " if len(to_move) < len(self.image_data) else ""
 
         prefix = self.prefix_entry.get().strip()
+        if not prefix and not messagebox.askyesno(
+            "No Prefix",
+            "The filename prefix is blank, so the files will be named 001, 002, ...\n"
+            "with no date.\n\nMove them anyway?",
+            icon="warning", default="no"
+        ):
+            return
         if prefix and not prefix.endswith("_"):
             prefix += "_"
 

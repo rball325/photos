@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
-import os, json, threading, datetime, calendar, re, shutil, math, stat
+import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess
 import xml.etree.ElementTree as ET
 from send2trash import send2trash
 import piexif
@@ -197,6 +197,32 @@ def read_photo_metadata(path):
     seen = set()
     keywords = [k for k in keywords if k and not (k.lower() in seen or seen.add(k.lower()))]
     return date_taken, keywords
+
+
+def edit_keywords(paths, add=(), remove=()):
+    """Add and/or remove keywords on JPEGs with exiftool, which rewrites only the
+    metadata. Keywords go in XMP dc:subject (what digiKam, Lightroom, Windows
+    etc. filter on) and IPTC Keywords (for older tools). Returns exiftool's summary."""
+    args = ["-q", "-overwrite_original_in_place", "-charset", "iptc=UTF8", "-codedcharacterset=utf8"]
+    for kw in list(remove) + list(add):
+        args += [f"-XMP-dc:Subject-={kw}", f"-IPTC:Keywords-={kw}"]
+    for kw in add:  # removing first means a keyword already there isn't duplicated
+        args += [f"-XMP-dc:Subject+={kw}", f"-IPTC:Keywords+={kw}"]
+    # Photos are often kept read-only; lift that just long enough to write.
+    modes = {p: os.stat(p).st_mode for p in paths}
+    for p, mode in modes.items():
+        if not mode & stat.S_IWUSR:
+            os.chmod(p, mode | stat.S_IWUSR)
+    try:
+        result = subprocess.run(["exiftool", "-@", "-"], input="\n".join(args + list(paths)),
+                                capture_output=True, text=True)
+    finally:
+        for p, mode in modes.items():
+            if not mode & stat.S_IWUSR:
+                os.chmod(p, mode)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"exiftool exited with {result.returncode}")
+    return result.stderr.strip()
 
 
 def find_next_index(directory, prefix):
@@ -429,6 +455,138 @@ class ImageViewer(tk.Toplevel):
             self._redraw()
 
 
+class KeywordsWindow(tk.Toplevel):
+    """Modeless window for adding or removing EXIF subject keywords on the selected
+    photos, from a keyword list kept in config.json."""
+
+    def __init__(self, sorter):
+        super().__init__(sorter)
+        self.sorter = sorter
+        self.title("EXIF Subjects")
+        self.minsize(260, 300)
+
+        list_frame = tk.Frame(self)
+        self.listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False, height=12)
+        scrollbar = tk.Scrollbar(list_frame, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        list_frame.pack(fill="both", expand=True, padx=5, pady=(5, 0))
+
+        edit_frame = tk.Frame(self)
+        self.new_entry = tk.Entry(edit_frame)
+        self.new_entry.pack(side="left", fill="x", expand=True)
+        self.new_entry.bind("<Return>", lambda e: self.add_to_list())
+        tk.Button(edit_frame, text="+", width=2, command=self.add_to_list).pack(side="left", padx=(5, 0))
+        tk.Button(edit_frame, text="−", width=2, command=self.delete_from_list).pack(side="left", padx=(2, 0))
+        edit_frame.pack(fill="x", padx=5, pady=5)
+
+        self.target_label = tk.Label(self, anchor="w")
+        self.target_label.pack(fill="x", padx=5)
+        apply_frame = tk.Frame(self)
+        tk.Button(apply_frame, text="Add to Photos", command=lambda: self.apply(add=True)).pack(side="left", padx=2)
+        tk.Button(apply_frame, text="Remove from Photos", command=lambda: self.apply(add=False)).pack(side="left", padx=2)
+        apply_frame.pack(pady=5)
+        self.status_label = tk.Label(self, anchor="w", wraplength=320, justify="left")
+        self.status_label.pack(fill="x", padx=5, pady=(0, 5))
+
+        self.listbox.bind("<<ListboxSelect>>", lambda e: self.remember_highlights())
+        self.listbox.bind("<Button-1>", self.clear_on_empty_click)
+        self.refresh_list(select=set(sorter.keyword_highlights))
+        self.update_target_label()
+
+    def clear_on_empty_click(self, event):
+        # Clicks below the last keyword clear the highlights instead of toggling
+        # the nearest one, as a Listbox otherwise would.
+        bbox = self.listbox.bbox(self.listbox.nearest(event.y))
+        if bbox and event.y <= bbox[1] + bbox[3]:
+            return
+        self.listbox.selection_clear(0, "end")
+        self.remember_highlights()
+        return "break"
+
+    def refresh_list(self, select=()):
+        self.listbox.delete(0, "end")
+        for kw in self.sorter.subject_keywords:
+            self.listbox.insert("end", kw)
+            if kw in select:
+                self.listbox.selection_set("end")
+        self.remember_highlights()
+
+    def remember_highlights(self):
+        # Saved to config.json with everything else, so they come back next time.
+        self.sorter.keyword_highlights = self.checked()
+
+    def checked(self):
+        return [self.listbox.get(i) for i in self.listbox.curselection()]
+
+    def add_to_list(self):
+        kw = self.new_entry.get().strip()
+        if not kw:
+            return
+        keywords = self.sorter.subject_keywords
+        if kw.lower() not in (k.lower() for k in keywords):
+            keywords.append(kw)
+            keywords.sort(key=str.lower)
+            self.sorter.save_config()
+        self.new_entry.delete(0, "end")
+        self.refresh_list(select=set(self.checked()) | {kw})
+
+    def delete_from_list(self):
+        checked = self.checked()
+        if not checked:
+            self.status_label.config(text="Highlight keywords in the list to delete them.")
+            return
+        # Only the list changes; photos keep any keywords already written to them.
+        self.sorter.subject_keywords[:] = [k for k in self.sorter.subject_keywords if k not in checked]
+        self.sorter.save_config()
+        self.refresh_list()
+
+    def update_target_label(self):
+        # Polled so the label follows selection changes in the main window.
+        targets, selected = self.sorter.keyword_targets()
+        what = "selected photo(s)" if selected else "photo(s) — all of them, nothing is selected"
+        self.target_label.config(text=f"Applies to {len(targets)} {what}")
+        self.after(300, self.update_target_label)
+
+    def apply(self, add):
+        keywords = self.checked()
+        if not keywords:
+            self.status_label.config(text="Highlight one or more keywords in the list first.")
+            return
+        targets, selected = self.sorter.keyword_targets()
+        if not targets:
+            self.status_label.config(text="No photos loaded.")
+            return
+        names = [d["filename"] for d in targets]
+        jpegs = [os.path.join(self.sorter.image_directory, n) for n in names if n.lower().endswith(JPEG_EXTENSIONS)]
+        verb = "Add" if add else "Remove"
+        if not selected and not messagebox.askyesno(
+                f"{verb} Keywords", f"Nothing is selected.\n{verb} {', '.join(keywords)} "
+                f"{'to' if add else 'from'} all {len(names)} photos?", parent=self):
+            return
+        if not jpegs:
+            self.status_label.config(text="Keywords can only be written to JPEGs.")
+            return
+        self.config(cursor="watch"); self.update_idletasks()
+        try:
+            summary = edit_keywords(jpegs, add=keywords if add else (), remove=() if add else keywords)
+        except FileNotFoundError:
+            messagebox.showerror("EXIF", "exiftool isn't installed.", parent=self)
+            return
+        except Exception as e:
+            messagebox.showerror("EXIF", f"Could not write keywords:\n{e}", parent=self)
+            return
+        finally:
+            self.config(cursor="")
+        skipped = len(names) - len(jpegs)
+        self.status_label.config(
+            text=f"{'Added' if add else 'Removed'} {', '.join(keywords)} {'to' if add else 'from'} {len(jpegs)} photo(s)."
+                 + (f" Skipped {skipped} non-JPEG." if skipped else ""))
+        if summary:
+            print(summary)
+
+
 class DragDropSorter(tk.Tk):
 
     def load_config(self):
@@ -437,15 +595,40 @@ class DragDropSorter(tk.Tk):
                 config = json.load(f)
                 self.image_directory = config.get("image_directory", "")
                 self.move_destination = config.get("move_destination", "")
+                self.subject_keywords = config.get("subject_keywords", [])
+                self.saved_prefix = config.get("prefix", "")
+                self.saved_selections = config.get("selections", {})
+                self.keyword_highlights = config.get("keyword_highlights", [])
         else:
             self.image_directory = ""
             self.move_destination = ""
+            self.subject_keywords = []
+            self.saved_prefix = ""
+            self.saved_selections = {}
+            self.keyword_highlights = []
 
     def save_config(self):
+        if hasattr(self, "prefix_entry"):
+            self.saved_prefix = self.prefix_entry.get()
+        # Selections are remembered per folder. Record this folder's only once it has
+        # fully loaded, so a save made while switching folders or mid-load doesn't
+        # wipe the remembered one.
+        if self.grid_directory and hasattr(self, "on_disk_order"):
+            folder = os.path.normpath(self.grid_directory)
+            files = [d["filename"] for d in self.image_data if d["label"] in self.selected_widgets]
+            if files:
+                self.saved_selections[folder] = files
+            else:
+                self.saved_selections.pop(folder, None)
+        self.saved_selections = {f: names for f, names in self.saved_selections.items() if os.path.isdir(f)}
         with open(CONFIG_PATH, "w") as f:
             json.dump({
                 "image_directory": self.image_directory,
                 "move_destination": self.move_destination,
+                "subject_keywords": self.subject_keywords,
+                "prefix": self.saved_prefix,
+                "selections": self.saved_selections,
+                "keyword_highlights": self.keyword_highlights,
             }, f)
 
     def __init__(self):
@@ -466,6 +649,8 @@ class DragDropSorter(tk.Tk):
         self.metadata_cache = {}  # path -> (mtime, (date_taken, keywords))
         self.tooltip = None
         self.tooltip_after = None
+        self.keywords_window = None
+        self.grid_directory = None  # folder whose thumbnails are in the grid
         self.selected_widgets = []
         self.last_clicked_index = None
         self.dragged_widget = None
@@ -476,9 +661,14 @@ class DragDropSorter(tk.Tk):
 
         self.create_ui()
         self.folder_entry.insert(0, self.image_directory)
+        self.prefix_entry.insert(0, self.saved_prefix)
         #self.start_thumbnail_loading()
 
     def create_ui(self):
+        menubar = tk.Menu(self)
+        menubar.add_command(label="EXIF", command=self.open_keywords_window)
+        self.config(menu=menubar)
+
         source_frame = tk.Frame(self)
         
         self.folder_label = tk.Label(source_frame, text="Image Folder:")
@@ -524,10 +714,12 @@ class DragDropSorter(tk.Tk):
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)       # Windows & macOS
         self.canvas.bind_all("<Button-4>", self.on_mousewheel_linux)   # Linux scroll up
         self.canvas.bind_all("<Button-5>", self.on_mousewheel_linux)   # Linux scroll down
-        self.canvas.bind("<Button-1>", self.clear_selection_on_background)
+        self.bind_all("<Button-1>", self.clear_selection_on_background, add="+")
         self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
         self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
+        self.bind_all("<Control-a>", self.select_all)
+        self.bind_all("<Control-A>", self.select_all)
         self.bind_all("<Home>", lambda e: self.scroll_grid_to(e, 0.0))
         self.bind_all("<End>", lambda e: self.scroll_grid_to(e, 1.0))
         self.bind_all("<Prior>", lambda e: self.scroll_grid_page(-1))
@@ -602,6 +794,7 @@ class DragDropSorter(tk.Tk):
         self.folder_data = []
         self.selected_widgets.clear()
         self.last_clicked_index = None
+        self.grid_directory = None
         if hasattr(self, 'on_disk_order'):
             del self.on_disk_order
 
@@ -623,6 +816,10 @@ class DragDropSorter(tk.Tk):
     def on_app_close(self):
         if not self.check_unsaved_changes():
             return
+        try:
+            self.save_config()
+        except Exception as e:
+            print(f"⚠️ Could not save settings: {e}")
         self.destroy()
 
     def on_mousewheel(self, event):
@@ -647,14 +844,29 @@ class DragDropSorter(tk.Tk):
         self.canvas.yview_scroll(direction, "pages")
 
     def clear_selection_on_background(self, event):
+        # Clear on clicks in empty space or on plain labels in the main window, but not
+        # on buttons, text fields, the scrollbar or other windows, which act on the
+        # selection or are used alongside it.
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or widget.winfo_toplevel() is not self:
+            return
+        if widget.winfo_class() not in ("Canvas", "Frame", "Label", "Tk"):
+            return
+        if any(widget is d["label"] for d in self.image_data):
+            return
         self.canvas.focus_set()  # take focus from the entries so keys reach the grid
-        widget = self.winfo_containing(event.x_root, event.y_root)
-        # If not one of the image thumbnails, clear selection
-        if widget not in [d["label"] for d in self.image_data]:
-            for lbl in self.selected_widgets:
-                lbl.config(relief="raised", bd=2)
-            self.selected_widgets.clear()
-            self.last_clicked_index = None
+        for lbl in self.selected_widgets:
+            lbl.config(relief="raised", bd=2)
+        self.selected_widgets.clear()
+        self.last_clicked_index = None
+
+    def select_all(self, event):
+        if isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self:
+            return  # Ctrl-A in a text field or another window keeps its usual meaning
+        self.selected_widgets = [d["label"] for d in self.image_data]
+        for lbl in self.selected_widgets:
+            lbl.config(relief="solid", bd=4, highlightbackground="blue")
+        self.last_clicked_index = None
 
     def hide_hidden_files_in_dialogs(self):
         """Make Tk's own file/folder dialogs (used on X11) hide dotfiles, with a
@@ -687,6 +899,7 @@ class DragDropSorter(tk.Tk):
         # Bump the generation so a loader still running for a previous folder stops,
         # and any thumbnails it already queued via after() are discarded.
         self.load_generation += 1
+        self.grid_directory = self.image_directory
         threading.Thread(target=self.load_thumbnails_thread, daemon=True,
                          args=(self.load_generation, self.image_directory, self.image_files)).start()
 
@@ -739,7 +952,17 @@ class DragDropSorter(tk.Tk):
         if generation != self.load_generation:
             return
         self.set_on_disk_order()
+        self.restore_selection()
         self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded.")
+
+    def restore_selection(self):
+        """Re-select the photos that were selected when this folder was last open."""
+        names = set(self.saved_selections.get(os.path.normpath(self.grid_directory), []))
+        if not names:
+            return
+        self.selected_widgets = [d["label"] for d in self.image_data if d["filename"] in names]
+        for lbl in self.selected_widgets:
+            lbl.config(relief="solid", bd=4, highlightbackground="blue")
 
     def is_loading(self):
         # on_disk_order is only set once loading completes (see clear_grid / finish_loading).
@@ -778,6 +1001,19 @@ class DragDropSorter(tk.Tk):
         })
         self.update_scrollregion()
         self.loading_label.config(text=f"Loading {len(self.image_data)} of {self.total_files}...")
+
+    def open_keywords_window(self):
+        if self.keywords_window and self.keywords_window.winfo_exists():
+            self.keywords_window.deiconify()
+            self.keywords_window.lift()
+            return
+        self.keywords_window = KeywordsWindow(self)
+
+    def keyword_targets(self):
+        """Photos the EXIF window acts on: the selection (in grid order), else all.
+        Returns (photos, whether they're a selection)."""
+        selected = [d for d in self.image_data if d["label"] in self.selected_widgets]
+        return (selected, True) if selected else (list(self.image_data), False)
 
     def open_image_viewer(self, filename):
         path = os.path.join(self.image_directory, filename)

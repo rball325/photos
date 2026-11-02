@@ -464,6 +464,7 @@ class KeywordsWindow(tk.Toplevel):
         self.sorter = sorter
         self.title("EXIF Subjects")
         self.minsize(260, 300)
+        self.transient(sorter)  # stay above the main window while working in the grid
 
         list_frame = tk.Frame(self)
         self.listbox = tk.Listbox(list_frame, selectmode="multiple", exportselection=False, height=12)
@@ -480,6 +481,16 @@ class KeywordsWindow(tk.Toplevel):
         tk.Button(edit_frame, text="+", width=2, command=self.add_to_list).pack(side="left", padx=(5, 0))
         tk.Button(edit_frame, text="−", width=2, command=self.delete_from_list).pack(side="left", padx=(2, 0))
         edit_frame.pack(fill="x", padx=5, pady=5)
+
+        path_frame = tk.Frame(self)
+        self.from_path = tk.BooleanVar(value=sorter.keywords_from_path)
+        self.from_path.trace_add("write", lambda *a: setattr(sorter, "keywords_from_path", self.from_path.get()))
+        tk.Checkbutton(path_frame, text="From Path", variable=self.from_path).pack(side="left")
+        self.root_label = tk.Label(path_frame, anchor="w", fg="#555")
+        self.root_label.pack(side="left", fill="x", expand=True)
+        tk.Button(path_frame, text="Root...", command=self.choose_photo_root).pack(side="left")
+        path_frame.pack(fill="x", padx=5)
+        self.update_root_label()
 
         self.target_label = tk.Label(self, anchor="w")
         self.target_label.pack(fill="x", padx=5)
@@ -542,6 +553,27 @@ class KeywordsWindow(tk.Toplevel):
         self.sorter.save_config()
         self.refresh_list()
 
+    def update_root_label(self):
+        root = self.sorter.photo_root
+        self.root_label.config(text=f"below {root.replace(os.path.expanduser('~'), '~', 1)}" if root else "(no root set)")
+
+    def choose_photo_root(self):
+        folder = filedialog.askdirectory(parent=self, title="Root of the photo tree",
+                                         initialdir=self.sorter.photo_root or self.sorter.image_directory)
+        if folder:
+            self.sorter.photo_root = os.path.normpath(folder)
+            self.sorter.save_config()
+            self.update_root_label()
+
+    def path_keywords(self):
+        """Folder names from just below the photo root down to the current folder,
+        or None if the current folder isn't inside the root."""
+        root = self.sorter.photo_root
+        rel = os.path.relpath(os.path.normpath(self.sorter.image_directory), root) if root else os.pardir
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            return None
+        return [] if rel == os.curdir else rel.split(os.sep)
+
     def update_target_label(self):
         # Polled so the label follows selection changes in the main window.
         targets, selected = self.sorter.keyword_targets()
@@ -551,8 +583,14 @@ class KeywordsWindow(tk.Toplevel):
 
     def apply(self, add):
         keywords = self.checked()
+        if self.from_path.get():
+            path_kws = self.path_keywords()
+            if path_kws is None:
+                self.status_label.config(text="This folder isn't inside the photo root. Use Root... to set it.")
+                return
+            keywords += [k for k in path_kws if k.lower() not in (c.lower() for c in keywords)]
         if not keywords:
-            self.status_label.config(text="Highlight one or more keywords in the list first.")
+            self.status_label.config(text="Highlight one or more keywords in the list, or tick From Path, first.")
             return
         targets, selected = self.sorter.keyword_targets()
         if not targets:
@@ -599,6 +637,8 @@ class DragDropSorter(tk.Tk):
                 self.saved_prefix = config.get("prefix", "")
                 self.saved_selections = config.get("selections", {})
                 self.keyword_highlights = config.get("keyword_highlights", [])
+                self.photo_root = config.get("photo_root", "")
+                self.keywords_from_path = config.get("keywords_from_path", False)
         else:
             self.image_directory = ""
             self.move_destination = ""
@@ -606,6 +646,10 @@ class DragDropSorter(tk.Tk):
             self.saved_prefix = ""
             self.saved_selections = {}
             self.keyword_highlights = []
+            self.photo_root = ""
+            self.keywords_from_path = False
+        if not self.photo_root and os.path.isdir(os.path.expanduser("~/Photos")):
+            self.photo_root = os.path.expanduser("~/Photos")
 
     def save_config(self):
         if hasattr(self, "prefix_entry"):
@@ -629,6 +673,8 @@ class DragDropSorter(tk.Tk):
                 "prefix": self.saved_prefix,
                 "selections": self.saved_selections,
                 "keyword_highlights": self.keyword_highlights,
+                "photo_root": self.photo_root,
+                "keywords_from_path": self.keywords_from_path,
             }, f)
 
     def __init__(self):

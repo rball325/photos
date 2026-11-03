@@ -994,6 +994,8 @@ class DragDropSorter(tk.Tk):
         self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
         folder = self.folder_at(event.x_root, event.y_root)
         if folder and folder["name"] != "..":
+            self.grid_menu.add_command(label=f"Rename Folder '{folder['name']}'...",
+                                       command=lambda n=folder["name"]: self.rename_folder(n))
             self.grid_menu.add_command(label=f"Delete Folder '{folder['name']}'...",
                                        command=lambda n=folder["name"]: self.delete_folder(n))
         self.grid_menu.tk_popup(event.x_root, event.y_root)
@@ -1028,13 +1030,47 @@ class DragDropSorter(tk.Tk):
         self.loading_label.config(text=f"Moved folder '{name}' to the trash.")
         self.refresh_folders()
 
-    def create_folder(self):
-        name = simpledialog.askstring("New Folder", "Folder name:", parent=self)
+    def ask_folder_name(self, title, initial=""):
+        """Ask for a folder name; None if cancelled or not a usable name."""
+        name = simpledialog.askstring(title, "Folder name:", initialvalue=initial, parent=self)
         name = (name or "").strip()
         if not name:
-            return
+            return None
         if os.sep in name or name.startswith("."):
-            messagebox.showerror("New Folder", "Folder names can't contain '/' or start with '.'.")
+            messagebox.showerror(title, "Folder names can't contain '/' or start with '.'.")
+            return None
+        return name
+
+    def rename_folder(self, name):
+        new_name = self.ask_folder_name("Rename Folder", name)
+        if not new_name or new_name == name:
+            return
+        old_path = os.path.join(self.image_directory, name)
+        new_path = os.path.join(self.image_directory, new_name)
+        # Checked by hand: os.rename would silently replace an empty folder of that name.
+        if os.path.exists(new_path) and not os.path.samefile(old_path, new_path):
+            messagebox.showerror("Rename Folder", f"'{new_name}' already exists.")
+            return
+        try:
+            os.rename(old_path, new_path)
+        except OSError as e:
+            messagebox.showerror("Rename Folder", f"Could not rename '{name}':\n{e}")
+            return
+        # Keep remembered selections for the folder and anything below it.
+        old_norm = os.path.normpath(old_path)
+        self.saved_selections = {
+            (os.path.join(new_path, os.path.relpath(f, old_norm)) if f == old_norm or f.startswith(old_norm + os.sep) else f): names
+            for f, names in self.saved_selections.items()}
+        self.saved_selections = {os.path.normpath(f): n for f, n in self.saved_selections.items()}
+        # Logged as a move within this folder, so Restore From Log renames it back.
+        self.write_move_log("", self.image_directory, [
+            {"original": name, "final": new_name, "destination": self.image_directory}])
+        self.loading_label.config(text=f"Renamed folder '{name}' to '{new_name}'.")
+        self.refresh_folders()
+
+    def create_folder(self):
+        name = self.ask_folder_name("New Folder")
+        if not name:
             return
         try:
             os.mkdir(os.path.join(self.image_directory, name))
@@ -1321,6 +1357,7 @@ class DragDropSorter(tk.Tk):
             return
         self.dragged_widget = label
         self._drag_pressed = True
+        self._press_point = (event.x_root, event.y_root)
         self.handle_click(event, label)
 
     def on_drag_motion(self, event):
@@ -1400,6 +1437,10 @@ class DragDropSorter(tk.Tk):
         self.refresh_folders()
 
     def handle_drag_motion(self, event, label):
+        if not self._is_dragging:
+            dx, dy = event.x_root - self._press_point[0], event.y_root - self._press_point[1]
+            if dx * dx + dy * dy < 36:
+                return  # small jitter during a click isn't a drag
         self._is_dragging = True
         self.dragged_widget = label  # Prep drag target
         self.create_drag_cursor(event)  # Show drag visual
@@ -1453,38 +1494,38 @@ class DragDropSorter(tk.Tk):
         self.canvas.unbind("<Motion>")
         self.destroy_drag_cursor(event)
         self.highlight_drop_folder(None)
-        folder =self.folder_at(event.x_root, event.y_root) if self._is_dragging else None
-        if folder and hasattr(self, "on_disk_order"):
-            self.highlight_drop_folder(None)
-            self._is_dragging = False
-            group = [d for d in self.image_data if d["label"] in self.selected_widgets]
-            if group:
-                self.move_to_subfolder(group, folder["name"])
+        if not self._is_dragging:
+            return
+        self._is_dragging = False
+        if not hasattr(self, "on_disk_order"):
+            return
+        group = [d for d in self.image_data if d["label"] in self.selected_widgets]
+        if not group:
+            return
+        folder = self.folder_at(event.x_root, event.y_root)
+        if folder:
+            self.move_to_subfolder(group, folder["name"])
             return
         # Hit-test against the fixed cell layout in canvas coordinates; widget
         # winfo_x/y aren't kept current for items scrolled out of view.
-        x = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
-        y = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
-        target = None
-        column = int(x // self.cell_size)
-        position = (int(y // self.cell_size) - self.grid_row_offset) * self.max_columns + column
-        if 0 <= column < self.max_columns and 0 <= position < len(self.image_data):
-            lbl = self.image_data[position]["label"]
-            if lbl != self.dragged_widget:
-                target = lbl
-        if self.selected_widgets:
-            group = [d for d in self.image_data if d["label"] in self.selected_widgets]
-            remaining = [d for d in self.image_data if d["label"] not in self.selected_widgets]
-            if target:
-                target_idx = next((i for i, d in enumerate(remaining) if d["label"] == target), len(remaining))
-            elif self._is_dragging:
-                target_idx = len(remaining)  # drop past last item → append to end
-            else:
-                target_idx = None
-            if target_idx is not None:
-                self.image_data = remaining[:target_idx] + group + remaining[target_idx:]
-                self.redraw_grid()
-        self._is_dragging = False
+        px, py = event.x_root - self.canvas.winfo_rootx(), event.y_root - self.canvas.winfo_rooty()
+        if not (0 <= px < self.canvas.winfo_width() and 0 <= py < self.canvas.winfo_height()):
+            return  # dropped outside the grid
+        column = int(self.canvas.canvasx(px) // self.cell_size)
+        row = int(self.canvas.canvasy(py) // self.cell_size) - self.grid_row_offset
+        if not 0 <= column < self.max_columns or row < 0:
+            return
+        position = row * self.max_columns + column
+        remaining = [d for d in self.image_data if d["label"] not in self.selected_widgets]
+        if position < len(self.image_data):
+            target = self.image_data[position]["label"]
+            if target in self.selected_widgets:
+                return  # dropped back onto the selection: leave the order alone
+            target_idx = next(i for i, d in enumerate(remaining) if d["label"] is target)
+        else:
+            target_idx = len(remaining)  # dropped past the last photo: move to the end
+        self.image_data = remaining[:target_idx] + group + remaining[target_idx:]
+        self.redraw_grid()
 
     def set_dragged_widget(self, label):
         self.dragged_widget = label

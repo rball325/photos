@@ -699,7 +699,7 @@ class DragDropSorter(tk.Tk):
         self.keywords_window = None
         self.grid_directory = None  # folder whose thumbnails are in the grid
         self.selected_widgets = []
-        self.last_clicked_index = None
+        self.last_clicked_label = None
         self.dragged_widget = None
         self._is_dragging = False
 
@@ -758,7 +758,6 @@ class DragDropSorter(tk.Tk):
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.configure(yscrollincrement=10)
         self.grid_menu = tk.Menu(self, tearoff=0)
-        self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
         self.canvas.bind("<Button-3>", self.show_grid_menu)
 
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)       # Windows & macOS
@@ -847,7 +846,7 @@ class DragDropSorter(tk.Tk):
         self.image_data.clear()
         self.folder_data = []
         self.selected_widgets.clear()
-        self.last_clicked_index = None
+        self.last_clicked_label = None
         self.grid_directory = None
         if hasattr(self, 'on_disk_order'):
             del self.on_disk_order
@@ -912,7 +911,7 @@ class DragDropSorter(tk.Tk):
         for lbl in self.selected_widgets:
             lbl.config(relief="raised", bd=2)
         self.selected_widgets.clear()
-        self.last_clicked_index = None
+        self.last_clicked_label = None
 
     def select_all(self, event):
         if isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self:
@@ -920,7 +919,7 @@ class DragDropSorter(tk.Tk):
         self.selected_widgets = [d["label"] for d in self.image_data]
         for lbl in self.selected_widgets:
             lbl.config(relief="solid", bd=4, highlightbackground="blue")
-        self.last_clicked_index = None
+        self.last_clicked_label = None
 
     def hide_hidden_files_in_dialogs(self):
         """Make Tk's own file/folder dialogs (used on X11) hide dotfiles, with a
@@ -987,8 +986,45 @@ class DragDropSorter(tk.Tk):
         self.redraw_grid()
 
     def show_grid_menu(self, event):
-        if self.grid_directory:
-            self.grid_menu.tk_popup(event.x_root, event.y_root)
+        if not self.grid_directory:
+            return
+        self.grid_menu.delete(0, "end")
+        self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
+        folder = self.folder_at(event.x_root, event.y_root)
+        if folder and folder["name"] != "..":
+            self.grid_menu.add_command(label=f"Delete Folder '{folder['name']}'...",
+                                       command=lambda n=folder["name"]: self.delete_folder(n))
+        self.grid_menu.tk_popup(event.x_root, event.y_root)
+
+    def delete_folder(self, name):
+        """Send a folder to the trash, asking first if it holds anything besides
+        its thumbnail cache."""
+        path = os.path.join(self.image_directory, name)
+        photos = folders = others = 0
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = [d for d in dirnames if d != THUMB_DIR]
+            folders += len(dirnames)
+            for f in filenames:
+                if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                    photos += 1
+                else:
+                    others += 1
+        if photos or folders or others:
+            contents = ", ".join(f"{n} {what}" for n, what in (
+                (photos, "photo(s)"), (folders, "subfolder(s)"), (others, "other file(s)")) if n)
+            if not messagebox.askyesno(
+                    "Delete Folder",
+                    f"'{name}' is not empty. It contains {contents}, counting everything inside its subfolders.\n\n"
+                    "Move the folder and everything in it to the trash?",
+                    icon="warning", default="no"):
+                return
+        try:
+            send2trash(path)
+        except Exception as e:
+            messagebox.showerror("Delete Folder", f"Could not delete '{name}':\n{e}")
+            return
+        self.loading_label.config(text=f"Moved folder '{name}' to the trash.")
+        self.refresh_folders()
 
     def create_folder(self):
         name = simpledialog.askstring("New Folder", "Folder name:", parent=self)
@@ -1117,7 +1153,7 @@ class DragDropSorter(tk.Tk):
         lbl.image = photo
         item = self.canvas.create_window(*self.cell_center(row, column), window=lbl)
 
-        lbl.bind("<Button-1>", lambda e, l=lbl, i=idx: self.handle_click_and_drag(e, l, i))
+        lbl.bind("<Button-1>", lambda e, l=lbl: self.handle_click_and_drag(e, l))
         lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
         lbl.bind("<Enter>", lambda e, l=lbl: self.schedule_tooltip(l))
         lbl.bind("<Leave>", self.hide_tooltip)
@@ -1174,7 +1210,7 @@ class DragDropSorter(tk.Tk):
             self.image_data.remove(data)
 
         self.selected_widgets.clear()
-        self.last_clicked_index = None
+        self.last_clicked_label = None
         self.set_on_disk_order()
         self.redraw_grid()
 
@@ -1276,14 +1312,14 @@ class DragDropSorter(tk.Tk):
         data["photo"] = photo
         self.loading_label.config(text=f"↻ Rotated {data['filename']}")
 
-    def handle_click_and_drag(self, event, label, index):
+    def handle_click_and_drag(self, event, label):
         self.canvas.focus_set()  # take focus from the entries so keys reach the grid
         self.hide_tooltip()
         if not hasattr(self, 'on_disk_order'):
             return
         self.dragged_widget = label
         self._drag_pressed = True
-        self.handle_click(event, label, index)
+        self.handle_click(event, label)
 
     def on_drag_motion(self, event):
         if getattr(self, "_drag_pressed", False):
@@ -1306,7 +1342,10 @@ class DragDropSorter(tk.Tk):
         if not getattr(self, "_autoscroll_after", None):
             self.auto_scroll()
 
-    def handle_click(self, event, label, index):
+    def handle_click(self, event, label):
+        # The shift-click anchor is kept as a label and both ends are looked up now:
+        # positions change whenever photos are reordered, moved out or deleted.
+        positions = {d["label"]: i for i, d in enumerate(self.image_data)}
         ctrl_pressed = (event.state & 0x0004) != 0
         shift_pressed = (event.state & 0x0001) != 0
 
@@ -1317,11 +1356,11 @@ class DragDropSorter(tk.Tk):
             else:
                 self.selected_widgets.append(label)
                 label.config(relief="solid", bd=4, highlightbackground="blue")
-            self.last_clicked_index = index
+            self.last_clicked_label = label
 
         elif shift_pressed:
-            if self.last_clicked_index is not None:
-                i1, i2 = sorted((self.last_clicked_index, index))
+            if self.last_clicked_label in positions:
+                i1, i2 = sorted((positions[self.last_clicked_label], positions[label]))
                 for i in range(i1, i2 + 1):
                     lbl = self.image_data[i]["label"]
                     if lbl not in self.selected_widgets:
@@ -1330,18 +1369,18 @@ class DragDropSorter(tk.Tk):
             else:
                 self.selected_widgets = [label]
                 label.config(relief="solid", bd=4, highlightbackground="blue")
-                self.last_clicked_index = index
+                self.last_clicked_label = label
 
         else:
             # If already selected, don’t reset — just prep for drag
             if label in self.selected_widgets:
-                self.last_clicked_index = index
+                self.last_clicked_label = label
             else:
                 for lbl in self.selected_widgets:
                     lbl.config(relief="raised", bd=2)
                 self.selected_widgets = [label]
                 label.config(relief="solid", bd=4, highlightbackground="blue")
-                self.last_clicked_index = index
+                self.last_clicked_label = label
 
     def finish_drag(self, event):
         self.canvas.unbind("<Motion>")
@@ -1576,7 +1615,7 @@ class DragDropSorter(tk.Tk):
             self.image_data.remove(data)
             if data["label"] in self.selected_widgets:
                 self.selected_widgets.remove(data["label"])
-        self.last_clicked_index = None
+        self.last_clicked_label = None
         self.redraw_grid()
         # Drop the moved files from the saved order without marking any unsaved
         # reordering of the files left behind as saved.

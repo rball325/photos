@@ -148,6 +148,7 @@ def move_cached_thumb(old_path, new_path):
 
 
 TRASH_DIR = ".trash"
+LOG_FILE_RE = re.compile(r"(restored\d*_)?(rename|move)_log_.*\.json$")
 
 
 def move_to_trash(directory, name):
@@ -1041,19 +1042,22 @@ class DragDropSorter(tk.Tk):
         self.grid_menu.tk_popup(event.x_root, event.y_root)
 
     def delete_folder(self, name):
-        """Move a folder into .trash, asking first if it holds anything besides
-        its thumbnail cache."""
+        """Move a folder into .trash, asking first if it or any subfolder holds files
+        other than thumbnail caches and rename/move logs."""
         path = os.path.join(self.image_directory, name)
         photos = folders = others = 0
         for dirpath, dirnames, filenames in os.walk(path):
             dirnames[:] = [d for d in dirnames if d != THUMB_DIR]
             folders += len(dirnames)
             for f in filenames:
+                if LOG_FILE_RE.match(f):
+                    continue  # this app's own logs, including retired restored_* ones
                 if f.lower().endswith((".jpg", ".jpeg", ".png")):
                     photos += 1
                 else:
                     others += 1
-        if photos or folders or others:
+        # Subfolders alone (empty, or holding only logs) aren't worth a warning.
+        if photos or others:
             contents = ", ".join(f"{n} {what}" for n, what in (
                 (photos, "photo(s)"), (folders, "subfolder(s)"), (others, "other file(s)")) if n)
             if not messagebox.askyesno(

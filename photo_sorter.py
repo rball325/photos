@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
+from tkinter import simpledialog
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
 import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess
 import xml.etree.ElementTree as ET
@@ -756,12 +757,19 @@ class DragDropSorter(tk.Tk):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
         self.canvas.configure(yscrollincrement=10)
+        self.grid_menu = tk.Menu(self, tearoff=0)
+        self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
+        self.canvas.bind("<Button-3>", self.show_grid_menu)
 
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)       # Windows & macOS
         self.canvas.bind_all("<Button-4>", self.on_mousewheel_linux)   # Linux scroll up
         self.canvas.bind_all("<Button-5>", self.on_mousewheel_linux)   # Linux scroll down
         self.bind_all("<Button-1>", self.clear_selection_on_background, add="+")
-        self.bind_all("<ButtonRelease-1>", self.destroy_drag_cursor)
+        # Drags are tracked here rather than on the pressed thumbnail: auto-scroll can
+        # carry that thumbnail out of view, and Tk unmaps it, which ends its pointer
+        # grab and would cut off its motion and release events mid-drag.
+        self.bind_all("<B1-Motion>", self.on_drag_motion)
+        self.bind_all("<ButtonRelease-1>", self.on_button_release)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
         self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
         self.bind_all("<Control-a>", self.select_all)
@@ -928,13 +936,16 @@ class DragDropSorter(tk.Tk):
         self.tk.call("set", "::tk::dialog::file::showHiddenBtn", 1)
         self.tk.call("set", "::tk::dialog::file::showHiddenVar", 0)
 
-    def start_thumbnail_loading(self):
-        entries = sorted(e for e in os.listdir(self.image_directory) if not e.startswith("."))
-        self.folder_names = [d for d in entries
-                              if os.path.isdir(os.path.join(self.image_directory, d))]
+    def list_folders(self, entries):
+        folders = [d for d in entries if os.path.isdir(os.path.join(self.image_directory, d))]
         parent = os.path.dirname(self.image_directory.rstrip(os.sep))
         if parent and parent != self.image_directory.rstrip(os.sep):
-            self.folder_names = [".."] + self.folder_names
+            folders = [".."] + folders
+        return folders
+
+    def start_thumbnail_loading(self):
+        entries = sorted(e for e in os.listdir(self.image_directory) if not e.startswith("."))
+        self.folder_names = self.list_folders(entries)
         self.image_files = [f for f in entries
                             if f.lower().endswith((".jpg", ".jpeg", ".png"))]
         self.total_files = len(self.image_files)
@@ -958,10 +969,86 @@ class DragDropSorter(tk.Tk):
             lbl = tk.Label(self.canvas, text=f"📁 {display}", width=14, height=6,
                            wraplength=100, justify="center",
                            bg="#dde8f5", bd=2, relief="raised")
-            self.canvas.create_window(*self.cell_center(row, column), window=lbl)
+            item = self.canvas.create_window(*self.cell_center(row, column), window=lbl)
             lbl.bind("<Button-1>", lambda e, n=name: self.navigate_to_folder(n))
-            self.folder_data.append({"name": name, "label": lbl})
+            lbl.bind("<Button-3>", self.show_grid_menu)
+            self.folder_data.append({"name": name, "label": lbl, "item": item})
         self.update_scrollregion()
+
+    def refresh_folders(self):
+        """Rebuild the folder tiles after one is added, shifting the photos to fit."""
+        for data in self.folder_data:
+            self.canvas.delete(data["item"])
+            data["label"].destroy()
+        entries = sorted(e for e in os.listdir(self.image_directory) if not e.startswith("."))
+        self.folder_names = self.list_folders(entries)
+        self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
+        self.add_folder_widgets()
+        self.redraw_grid()
+
+    def show_grid_menu(self, event):
+        if self.grid_directory:
+            self.grid_menu.tk_popup(event.x_root, event.y_root)
+
+    def create_folder(self):
+        name = simpledialog.askstring("New Folder", "Folder name:", parent=self)
+        name = (name or "").strip()
+        if not name:
+            return
+        if os.sep in name or name.startswith("."):
+            messagebox.showerror("New Folder", "Folder names can't contain '/' or start with '.'.")
+            return
+        try:
+            os.mkdir(os.path.join(self.image_directory, name))
+        except FileExistsError:
+            messagebox.showerror("New Folder", f"'{name}' already exists.")
+            return
+        except OSError as e:
+            messagebox.showerror("New Folder", f"Could not create '{name}':\n{e}")
+            return
+        self.refresh_folders()
+
+    def folder_at(self, x_root, y_root):
+        """The folder tile under a screen point, if any."""
+        x = self.canvas.canvasx(x_root - self.canvas.winfo_rootx())
+        y = self.canvas.canvasy(y_root - self.canvas.winfo_rooty())
+        if not (0 <= x_root - self.canvas.winfo_rootx() < self.canvas.winfo_width()
+                and 0 <= y_root - self.canvas.winfo_rooty() < self.canvas.winfo_height()):
+            return None
+        column, row = int(x // self.cell_size), int(y // self.cell_size)
+        index = row * self.max_columns + column
+        if 0 <= column < self.max_columns and 0 <= row < self.grid_row_offset and index < len(self.folder_data):
+            return self.folder_data[index]
+        return None
+
+    def highlight_drop_folder(self, folder):
+        for data in self.folder_data:
+            data["label"].config(bg="#9cc3ee" if data is folder else "#dde8f5")
+
+    def move_to_subfolder(self, group, folder_name):
+        """Move photos dragged onto a folder tile, keeping their names. Logged like
+        Move & Rename, so Restore From Log puts them back."""
+        dest_dir = os.path.normpath(os.path.join(self.image_directory, folder_name))
+        moved, log_entries = [], []
+        for data in group:
+            old_path = os.path.join(self.image_directory, data["filename"])
+            new_path = os.path.join(dest_dir, data["filename"])
+            if os.path.exists(new_path) and not messagebox.askyesno(
+                    "Conflict Warning",
+                    f"'{data['filename']}' already exists in {os.path.basename(dest_dir)}.\nOverwrite?"):
+                continue
+            try:
+                shutil.move(old_path, new_path)
+                move_cached_thumb(old_path, new_path)
+            except Exception as e:
+                print(f"⚠️ Move failed for {data['filename']}: {e}")
+                continue
+            log_entries.append({"original": data["filename"], "final": data["filename"], "destination": dest_dir})
+            moved.append(data)
+        self.remove_moved_from_grid(moved)
+        shown = "the parent folder" if folder_name == ".." else folder_name
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {shown}.")
+        self.write_move_log("", dest_dir, log_entries)
 
     def load_thumbnails_thread(self, generation, directory, files):
         for idx, file in enumerate(files):
@@ -1032,10 +1119,9 @@ class DragDropSorter(tk.Tk):
 
         lbl.bind("<Button-1>", lambda e, l=lbl, i=idx: self.handle_click_and_drag(e, l, i))
         lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
-        lbl.bind("<B1-Motion>", lambda e, l=lbl: self.handle_drag_motion(e, l))
-        lbl.bind("<ButtonRelease-1>", self.finish_drag)
         lbl.bind("<Enter>", lambda e, l=lbl: self.schedule_tooltip(l))
         lbl.bind("<Leave>", self.hide_tooltip)
+        lbl.bind("<Button-3>", self.show_grid_menu)
 
         self.image_data.append({
             "filename": file,
@@ -1196,14 +1282,29 @@ class DragDropSorter(tk.Tk):
         if not hasattr(self, 'on_disk_order'):
             return
         self.dragged_widget = label
+        self._drag_pressed = True
         self.handle_click(event, label, index)
+
+    def on_drag_motion(self, event):
+        if getattr(self, "_drag_pressed", False):
+            self.handle_drag_motion(event, self.dragged_widget)
+
+    def on_button_release(self, event):
+        if getattr(self, "_drag_pressed", False):
+            self._drag_pressed = False
+            self.finish_drag(event)
+        else:
+            self.destroy_drag_cursor(event)
 
     def handle_drag_motion(self, event, label):
         self._is_dragging = True
         self.dragged_widget = label  # Prep drag target
         self.create_drag_cursor(event)  # Show drag visual
-        self.auto_scroll(event)        # Scroll if near edge
         self.move_drag_cursor(event)   # Move overlay
+        self._drag_pointer = (event.x_root, event.y_root)
+        self.highlight_drop_folder(self.folder_at(*self._drag_pointer))
+        if not getattr(self, "_autoscroll_after", None):
+            self.auto_scroll()
 
     def handle_click(self, event, label, index):
         ctrl_pressed = (event.state & 0x0004) != 0
@@ -1245,6 +1346,15 @@ class DragDropSorter(tk.Tk):
     def finish_drag(self, event):
         self.canvas.unbind("<Motion>")
         self.destroy_drag_cursor(event)
+        self.highlight_drop_folder(None)
+        folder =self.folder_at(event.x_root, event.y_root) if self._is_dragging else None
+        if folder and hasattr(self, "on_disk_order"):
+            self.highlight_drop_folder(None)
+            self._is_dragging = False
+            group = [d for d in self.image_data if d["label"] in self.selected_widgets]
+            if group:
+                self.move_to_subfolder(group, folder["name"])
+            return
         # Hit-test against the fixed cell layout in canvas coordinates; widget
         # winfo_x/y aren't kept current for items scrolled out of view.
         x = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
@@ -1455,6 +1565,11 @@ class DragDropSorter(tk.Tk):
             })
             moved.append(data)
 
+        self.remove_moved_from_grid(moved)
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
+        self.write_move_log(prefix, dest_dir, log_entries)
+
+    def remove_moved_from_grid(self, moved):
         for data in moved:
             self.canvas.delete(data["item"])
             data["label"].destroy()
@@ -1467,8 +1582,8 @@ class DragDropSorter(tk.Tk):
         # reordering of the files left behind as saved.
         moved_names = {d["filename"] for d in moved}
         self.on_disk_order = [f for f in self.on_disk_order if f not in moved_names]
-        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
 
+    def write_move_log(self, prefix, dest_dir, log_entries):
         if log_entries:
             timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
             log_name = f"move_log_{timestamp}.json"
@@ -1558,24 +1673,27 @@ class DragDropSorter(tk.Tk):
         self.clear_grid()
         self.start_thumbnail_loading()
 
-    def auto_scroll(self, event):
+    def auto_scroll(self):
+        """Scroll while a drag is held near (or past) the top or bottom edge of the
+        grid, repeating on a timer so the pointer needn't keep moving."""
+        self._autoscroll_after = None
+        if not getattr(self, "_drag_pressed", False):
+            return
         canvas_height = self.canvas.winfo_height()
-        canvas_top = self.canvas.winfo_rooty()
-        canvas_bottom = canvas_top + canvas_height
-        mouse_y = event.y_root
-
-        distance_from_top = mouse_y - canvas_top
-        distance_from_bottom = canvas_bottom - mouse_y
+        distance_from_top = self._drag_pointer[1] - self.canvas.winfo_rooty()
+        distance_from_bottom = canvas_height - distance_from_top
         edge_threshold = canvas_height / 6
 
         speed = 0
         if distance_from_top < edge_threshold:
-            speed = -int((edge_threshold - distance_from_top) / 60)
+            speed = -min(5, 1 + int((edge_threshold - distance_from_top) / 30))
         elif distance_from_bottom < edge_threshold:
-            speed = int((edge_threshold - distance_from_bottom) / 60)
-
-        if speed != 0:
-            self.canvas.yview_scroll(speed, "units")
+            speed = min(5, 1 + int((edge_threshold - distance_from_bottom) / 30))
+        if speed == 0:
+            return
+        self.canvas.yview_scroll(speed, "units")
+        self.highlight_drop_folder(self.folder_at(*self._drag_pointer))
+        self._autoscroll_after = self.after(50, self.auto_scroll)
 
 if __name__ == "__main__":
     app = DragDropSorter()

@@ -1111,6 +1111,7 @@ class DragDropSorter(tk.Tk):
             (os.path.join(new_path, os.path.relpath(f, old_norm)) if f == old_norm or f.startswith(old_norm + os.sep) else f): names
             for f, names in self.saved_selections.items()}
         self.saved_selections = {os.path.normpath(f): n for f, n in self.saved_selections.items()}
+        self.cut_folder_moved(old_path, new_path)
         # Logged as a move within this folder, so Restore From Log renames it back.
         self.write_move_log("", self.image_directory, [
             {"original": name, "final": new_name, "destination": self.image_directory}])
@@ -1191,6 +1192,21 @@ class DragDropSorter(tk.Tk):
         self.cut_files = (os.path.normpath(self.image_directory), names)
         self.loading_label.config(text=f"Cut {len(names)} photo(s). Open another folder and press Ctrl-V to move them there.")
 
+    def cut_files_renamed(self, directory, renames):
+        """Keep the cut list pointing at its photos after they're renamed in place."""
+        if self.cut_files and self.cut_files[0] == os.path.normpath(directory):
+            src_dir, names = self.cut_files
+            self.cut_files = (src_dir, [renames.get(n, n) for n in names])
+
+    def cut_folder_moved(self, old_path, new_path):
+        """Keep the cut list pointing at its folder after it (or a parent) moves."""
+        if not self.cut_files:
+            return
+        old_path, (src_dir, names) = os.path.normpath(old_path), self.cut_files
+        if src_dir == old_path or src_dir.startswith(old_path + os.sep):
+            src_dir = os.path.normpath(os.path.join(new_path, os.path.relpath(src_dir, old_path)))
+            self.cut_files = (src_dir, names)
+
     def paste_cut(self, event=None, folder_name=None):
         """Move the cut photos into the folder on screen, or into folder_name below it."""
         if event is not None and (isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self):
@@ -1210,6 +1226,11 @@ class DragDropSorter(tk.Tk):
         if dest_dir == here and not self.check_unsaved_changes():
             return
         present = [n for n in names if os.path.exists(os.path.join(src_dir, n))]
+        if not present:
+            self.cut_files = None
+            messagebox.showwarning("Paste", f"None of the {len(names)} cut photo(s) are in\n{src_dir}\n"
+                                   "any more. Nothing was moved.")
+            return
         moved = self.move_files(src_dir, present, dest_dir)
         self.cut_files = None
         missing = len(names) - len(present)
@@ -1533,6 +1554,7 @@ class DragDropSorter(tk.Tk):
         except Exception as e:
             messagebox.showerror("Move Folder", f"Could not move '{name}':\n{e}")
             return
+        self.cut_folder_moved(os.path.join(self.image_directory, name), os.path.join(dest_dir, name))
         shown = "the parent folder" if target == ".." else target
         self.loading_label.config(text=f"Moved folder '{name}' into {shown}.")
         self.write_move_log("", dest_dir, [{"original": name, "final": name, "destination": dest_dir}])
@@ -1715,6 +1737,8 @@ class DragDropSorter(tk.Tk):
                     print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
 
         self.set_on_disk_order()
+        self.cut_files_renamed(self.image_directory,
+                               {e["original"]: e["final"] for e in log_entries if "final" in e})
         self.loading_label.config(text=f"File renames complete.")
 
         # Save JSON log
@@ -1887,7 +1911,7 @@ class DragDropSorter(tk.Tk):
         if not messagebox.askyesno("Confirm Restore", prompt):
             return
 
-        restored = 0
+        restored, renames = 0, {}
         for entry in entries:
             if is_move:
                 current = os.path.join(entry.get("destination", log.get("destination", "")), entry["final"])
@@ -1906,9 +1930,12 @@ class DragDropSorter(tk.Tk):
                 shutil.move(current, original) if is_move else os.rename(current, original)
                 move_cached_thumb(current, original)
                 restored += 1
+                if not is_move:
+                    renames[os.path.basename(current)] = entry["original"]
             except Exception as e:
                 print(f"⚠️ Could not restore {os.path.basename(current)}: {e}")
 
+        self.cut_files_renamed(self.image_directory, renames)
         # Retire a fully-restored log so it isn't offered again: once a move is undone,
         # later moves reuse those destination names, and replaying the old log would
         # pull the new files back. A partial restore keeps the log so it can be retried.

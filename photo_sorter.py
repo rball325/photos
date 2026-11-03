@@ -702,6 +702,7 @@ class DragDropSorter(tk.Tk):
         self.last_clicked_label = None
         self.dragged_widget = None
         self._is_dragging = False
+        self._folder_drag = None
 
         self.load_config()
         self.hide_hidden_files_in_dialogs()
@@ -969,7 +970,8 @@ class DragDropSorter(tk.Tk):
                            wraplength=100, justify="center",
                            bg="#dde8f5", bd=2, relief="raised")
             item = self.canvas.create_window(*self.cell_center(row, column), window=lbl)
-            lbl.bind("<Button-1>", lambda e, n=name: self.navigate_to_folder(n))
+            # Opened on release rather than press, so a folder can be dragged instead.
+            lbl.bind("<Button-1>", lambda e, n=name, l=lbl: self.press_folder(e, n, l))
             lbl.bind("<Button-3>", self.show_grid_menu)
             self.folder_data.append({"name": name, "label": lbl, "item": item})
         self.update_scrollregion()
@@ -1324,13 +1326,78 @@ class DragDropSorter(tk.Tk):
     def on_drag_motion(self, event):
         if getattr(self, "_drag_pressed", False):
             self.handle_drag_motion(event, self.dragged_widget)
+        elif getattr(self, "_folder_drag", None):
+            self.handle_folder_drag_motion(event)
 
     def on_button_release(self, event):
-        if getattr(self, "_drag_pressed", False):
+        if getattr(self, "_folder_drag", None):
+            self.finish_folder_drag(event)
+        elif getattr(self, "_drag_pressed", False):
             self._drag_pressed = False
             self.finish_drag(event)
         else:
             self.destroy_drag_cursor(event)
+
+    def press_folder(self, event, name, label):
+        self.hide_tooltip()
+        self._folder_drag = {"name": name, "label": label, "start": (event.x_root, event.y_root), "moved": False}
+
+    def handle_folder_drag_motion(self, event):
+        drag = self._folder_drag
+        if drag["name"] == "..":
+            return  # the parent can be dropped onto, but not moved
+        if not drag["moved"]:
+            dx, dy = event.x_root - drag["start"][0], event.y_root - drag["start"][1]
+            if dx * dx + dy * dy < 36:
+                return  # small jitter during a click
+            drag["moved"] = True
+            self.drag_overlay = tk.Toplevel(self)
+            self.drag_overlay.overrideredirect(True)
+            self.drag_overlay.attributes("-topmost", True)
+            tk.Label(self.drag_overlay, text=f"📁 {drag['name']}", bg="#dde8f5", bd=1, relief="solid",
+                     padx=6, pady=4).pack()
+        self.move_drag_cursor(event)
+        self._drag_pointer = (event.x_root, event.y_root)
+        self.highlight_drop_folder(self.folder_drop_target())
+        if not getattr(self, "_autoscroll_after", None):
+            self.auto_scroll()
+
+    def folder_drop_target(self):
+        target = self.folder_at(*self._drag_pointer)
+        return target if target and target["label"] is not self._folder_drag["label"] else None
+
+    def finish_folder_drag(self, event):
+        drag = self._folder_drag
+        self._drag_pointer = (event.x_root, event.y_root)
+        if drag["moved"]:
+            target = self.folder_drop_target()
+            self._folder_drag = None
+            self.destroy_drag_cursor(event)
+            self.highlight_drop_folder(None)
+            if target:
+                self.move_folder(drag["name"], target["name"])
+            return
+        self._folder_drag = None
+        over = self.folder_at(event.x_root, event.y_root)
+        if over and over["label"] is drag["label"]:
+            self.navigate_to_folder(drag["name"])
+
+    def move_folder(self, name, target):
+        """Move a subfolder into another folder tile (or up to the parent). Logged like
+        photo moves, so Restore From Log puts it back."""
+        dest_dir = os.path.normpath(os.path.join(self.image_directory, target))
+        if os.path.exists(os.path.join(dest_dir, name)):
+            messagebox.showerror("Move Folder", f"'{name}' already exists in {os.path.basename(dest_dir)}.")
+            return
+        try:
+            shutil.move(os.path.join(self.image_directory, name), dest_dir)
+        except Exception as e:
+            messagebox.showerror("Move Folder", f"Could not move '{name}':\n{e}")
+            return
+        shown = "the parent folder" if target == ".." else target
+        self.loading_label.config(text=f"Moved folder '{name}' into {shown}.")
+        self.write_move_log("", dest_dir, [{"original": name, "final": name, "destination": dest_dir}])
+        self.refresh_folders()
 
     def handle_drag_motion(self, event, label):
         self._is_dragging = True
@@ -1716,7 +1783,7 @@ class DragDropSorter(tk.Tk):
         """Scroll while a drag is held near (or past) the top or bottom edge of the
         grid, repeating on a timer so the pointer needn't keep moving."""
         self._autoscroll_after = None
-        if not getattr(self, "_drag_pressed", False):
+        if not (getattr(self, "_drag_pressed", False) or getattr(self, "_folder_drag", None)):
             return
         canvas_height = self.canvas.winfo_height()
         distance_from_top = self._drag_pointer[1] - self.canvas.winfo_rooty()
@@ -1731,7 +1798,7 @@ class DragDropSorter(tk.Tk):
         if speed == 0:
             return
         self.canvas.yview_scroll(speed, "units")
-        self.highlight_drop_folder(self.folder_at(*self._drag_pointer))
+        self.highlight_drop_folder(self.folder_drop_target() if self._folder_drag else self.folder_at(*self._drag_pointer))
         self._autoscroll_after = self.after(50, self.auto_scroll)
 
 if __name__ == "__main__":

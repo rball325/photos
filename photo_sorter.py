@@ -5,7 +5,6 @@ from tkinter import simpledialog
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
 import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess
 import xml.etree.ElementTree as ET
-from send2trash import send2trash
 import piexif
 
 CONFIG_PATH = "config.json"
@@ -146,6 +145,24 @@ def move_cached_thumb(old_path, new_path):
         shutil.move(old_cache, new_cache)
     except OSError as e:
         print(f"⚠️ Could not move cached thumbnail {old_cache}: {e}")
+
+
+TRASH_DIR = ".trash"
+
+
+def move_to_trash(directory, name):
+    """Move a photo or folder into the hidden .trash folder beside it, instead of
+    deleting it. A plain rename, so read-only photos keep their mode. Returns the
+    name it was given there, suffixed if that name was already taken."""
+    trash = os.path.join(directory, TRASH_DIR)
+    os.makedirs(trash, exist_ok=True)
+    base, ext = (os.path.splitext(name) if os.path.isfile(os.path.join(directory, name)) else (name, ""))
+    final, n = name, 1
+    while os.path.exists(os.path.join(trash, final)):
+        n += 1
+        final = f"{base} ({n}){ext}"
+    os.rename(os.path.join(directory, name), os.path.join(trash, final))
+    return final
 
 
 def remove_cached_thumb(path):
@@ -1007,7 +1024,7 @@ class DragDropSorter(tk.Tk):
         self.grid_menu.tk_popup(event.x_root, event.y_root)
 
     def delete_folder(self, name):
-        """Send a folder to the trash, asking first if it holds anything besides
+        """Move a folder into .trash, asking first if it holds anything besides
         its thumbnail cache."""
         path = os.path.join(self.image_directory, name)
         photos = folders = others = 0
@@ -1025,15 +1042,17 @@ class DragDropSorter(tk.Tk):
             if not messagebox.askyesno(
                     "Delete Folder",
                     f"'{name}' is not empty. It contains {contents}, counting everything inside its subfolders.\n\n"
-                    "Move the folder and everything in it to the trash?",
+                    f"Move the folder and everything in it to {TRASH_DIR}?",
                     icon="warning", default="no"):
                 return
         try:
-            send2trash(path)
+            final = move_to_trash(self.image_directory, name)
         except Exception as e:
-            messagebox.showerror("Delete Folder", f"Could not delete '{name}':\n{e}")
+            messagebox.showerror("Delete Folder", f"Could not move '{name}' to {TRASH_DIR}:\n{e}")
             return
-        self.loading_label.config(text=f"Moved folder '{name}' to the trash.")
+        trash = os.path.join(self.image_directory, TRASH_DIR)
+        self.write_move_log("", trash, [{"original": name, "final": final, "destination": trash}])
+        self.loading_label.config(text=f"Moved folder '{name}' to {TRASH_DIR}.")
         self.refresh_folders()
 
     def ask_folder_name(self, title, initial=""):
@@ -1240,23 +1259,24 @@ class DragDropSorter(tk.Tk):
             return
 
         to_delete = [d for d in self.image_data if d["label"] in self.selected_widgets]
+        trash = os.path.join(self.image_directory, TRASH_DIR)
+        trashed, log_entries = [], []
         for data in to_delete:
             path = os.path.join(self.image_directory, data["filename"])
             try:
-                send2trash(path)
-                remove_cached_thumb(path)
-                print(f"🗑️ Deleted {path}")
+                final = move_to_trash(self.image_directory, data["filename"])
+                move_cached_thumb(path, os.path.join(trash, final))
+                print(f"🗑️ Moved {path} to {TRASH_DIR}")
             except Exception as e:
-                print(f"⚠️ Could not delete {path}: {e}")
+                print(f"⚠️ Could not move {path} to {TRASH_DIR}: {e}")
                 continue
-            self.canvas.delete(data["item"])
-            data["label"].destroy()
-            self.image_data.remove(data)
-
-        self.selected_widgets.clear()
-        self.last_clicked_label = None
-        self.set_on_disk_order()
-        self.redraw_grid()
+            log_entries.append({"original": data["filename"], "final": final, "destination": trash})
+            trashed.append(data)
+        self.remove_moved_from_grid(trashed)
+        if trashed:
+            self.loading_label.config(text=f"Moved {len(trashed)} photo(s) to {TRASH_DIR}.")
+        # Logged like a move, so Restore From Log brings them back.
+        self.write_move_log("", trash, log_entries)
 
     def create_drag_cursor(self, event):
         if getattr(self, "drag_overlay", None):
@@ -1739,7 +1759,11 @@ class DragDropSorter(tk.Tk):
     def write_move_log(self, prefix, dest_dir, log_entries):
         if log_entries:
             timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
-            log_name = f"move_log_{timestamp}.json"
+            log_name, n = f"move_log_{timestamp}.json", 1
+            # Several moves can land in the same second; don't let one log replace another.
+            while os.path.exists(os.path.join(self.image_directory, log_name)):
+                n += 1
+                log_name = f"move_log_{timestamp}_{n}.json"
             log_path = os.path.join(self.image_directory, log_name)
             try:
                 with open(log_path, "w") as f:

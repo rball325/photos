@@ -720,6 +720,7 @@ class DragDropSorter(tk.Tk):
         self.dragged_widget = None
         self._is_dragging = False
         self._folder_drag = None
+        self.cut_files = None  # (folder, filenames) waiting for Ctrl-V
 
         self.load_config()
         self.hide_hidden_files_in_dialogs()
@@ -791,6 +792,10 @@ class DragDropSorter(tk.Tk):
         self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
         self.bind_all("<Control-a>", self.select_all)
         self.bind_all("<Control-A>", self.select_all)
+        self.bind_all("<Control-x>", self.cut_selection)
+        self.bind_all("<Control-X>", self.cut_selection)
+        self.bind_all("<Control-v>", self.paste_cut)
+        self.bind_all("<Control-V>", self.paste_cut)
         self.bind_all("<Home>", lambda e: self.scroll_grid_to(e, 0.0))
         self.bind_all("<End>", lambda e: self.scroll_grid_to(e, 1.0))
         self.bind_all("<Prior>", lambda e: self.scroll_grid_page(-1))
@@ -1016,6 +1021,18 @@ class DragDropSorter(tk.Tk):
         self.grid_menu.delete(0, "end")
         self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
         folder = self.folder_at(event.x_root, event.y_root)
+        if self.selected_widgets:
+            self.grid_menu.add_command(label=f"Cut {len(self.selected_widgets)} Photo(s)", accelerator="Ctrl+X",
+                                       command=self.cut_selection)
+        if self.cut_files:
+            count = len(self.cut_files[1])
+            if folder:
+                shown = "Parent Folder" if folder["name"] == ".." else f"'{folder['name']}'"
+                self.grid_menu.add_command(label=f"Paste {count} Photo(s) into {shown}",
+                                           command=lambda n=folder["name"]: self.paste_cut(folder_name=n))
+            else:
+                self.grid_menu.add_command(label=f"Paste {count} Photo(s) Here", accelerator="Ctrl+V",
+                                           command=self.paste_cut)
         if folder and folder["name"] != "..":
             self.grid_menu.add_command(label=f"Rename Folder '{folder['name']}'...",
                                        command=lambda n=folder["name"]: self.rename_folder(n))
@@ -1128,26 +1145,78 @@ class DragDropSorter(tk.Tk):
         """Move photos dragged onto a folder tile, keeping their names. Logged like
         Move & Rename, so Restore From Log puts them back."""
         dest_dir = os.path.normpath(os.path.join(self.image_directory, folder_name))
+        moved = set(self.move_files(self.image_directory, [d["filename"] for d in group], dest_dir))
+        self.remove_moved_from_grid([d for d in group if d["filename"] in moved])
+        shown = "the parent folder" if folder_name == ".." else folder_name
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {shown}.")
+
+    def move_files(self, src_dir, names, dest_dir):
+        """Move files between folders keeping their names, logged in src_dir so
+        Restore From Log there puts them back. Returns the names that moved."""
         moved, log_entries = [], []
-        for data in group:
-            old_path = os.path.join(self.image_directory, data["filename"])
-            new_path = os.path.join(dest_dir, data["filename"])
+        for name in names:
+            old_path = os.path.join(src_dir, name)
+            new_path = os.path.join(dest_dir, name)
             if os.path.exists(new_path) and not messagebox.askyesno(
                     "Conflict Warning",
-                    f"'{data['filename']}' already exists in {os.path.basename(dest_dir)}.\nOverwrite?"):
+                    f"'{name}' already exists in {os.path.basename(dest_dir)}.\nOverwrite?"):
                 continue
             try:
                 shutil.move(old_path, new_path)
                 move_cached_thumb(old_path, new_path)
             except Exception as e:
-                print(f"⚠️ Move failed for {data['filename']}: {e}")
+                print(f"⚠️ Move failed for {name}: {e}")
                 continue
-            log_entries.append({"original": data["filename"], "final": data["filename"], "destination": dest_dir})
-            moved.append(data)
-        self.remove_moved_from_grid(moved)
-        shown = "the parent folder" if folder_name == ".." else folder_name
-        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {shown}.")
-        self.write_move_log("", dest_dir, log_entries)
+            log_entries.append({"original": name, "final": name, "destination": dest_dir})
+            moved.append(name)
+        self.write_move_log("", dest_dir, log_entries, log_dir=src_dir)
+        return moved
+
+    def cut_selection(self, event=None):
+        if event is not None and (isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self):
+            return  # Ctrl-X in a text field or another window keeps its usual meaning
+        if not hasattr(self, "on_disk_order"):
+            return
+        names = [d["filename"] for d in self.image_data if d["label"] in self.selected_widgets]
+        if not names:
+            self.loading_label.config(text="Select photos to cut first.")
+            return
+        self.cut_files = (os.path.normpath(self.image_directory), names)
+        self.loading_label.config(text=f"Cut {len(names)} photo(s). Open another folder and press Ctrl-V to move them there.")
+
+    def paste_cut(self, event=None, folder_name=None):
+        """Move the cut photos into the folder on screen, or into folder_name below it."""
+        if event is not None and (isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self):
+            return
+        if not self.cut_files:
+            self.loading_label.config(text="Nothing to paste. Select photos and press Ctrl-X first.")
+            return
+        if self.is_loading():
+            return
+        src_dir, names = self.cut_files
+        dest_dir = os.path.normpath(os.path.join(self.image_directory, folder_name or ""))
+        if dest_dir == src_dir:
+            self.loading_label.config(text="The cut photos are already in this folder.")
+            return
+        here = os.path.normpath(self.image_directory)
+        # Pasting here reloads the grid to show the new photos, which drops any unsaved order.
+        if dest_dir == here and not self.check_unsaved_changes():
+            return
+        present = [n for n in names if os.path.exists(os.path.join(src_dir, n))]
+        moved = self.move_files(src_dir, present, dest_dir)
+        self.cut_files = None
+        missing = len(names) - len(present)
+        note = f" {missing} could not be found." if missing else ""
+        if src_dir == here:  # pasted into a folder tile while still viewing their folder
+            self.remove_moved_from_grid([d for d in self.image_data if d["filename"] in set(moved)])
+        if dest_dir == here:
+            self.clear_grid()
+            self.saved_selections[here] = moved  # reselected once the reload finishes
+            self.start_thumbnail_loading()
+            print(f"Pasted {len(moved)} photo(s) from {src_dir}.{note}")
+        else:
+            shown = "the parent folder" if folder_name == ".." else folder_name
+            self.loading_label.config(text=f"Moved {len(moved)} photo(s) to {shown}.{note}")
 
     def load_thumbnails_thread(self, generation, directory, files):
         for idx, file in enumerate(files):
@@ -1756,15 +1825,18 @@ class DragDropSorter(tk.Tk):
         moved_names = {d["filename"] for d in moved}
         self.on_disk_order = [f for f in self.on_disk_order if f not in moved_names]
 
-    def write_move_log(self, prefix, dest_dir, log_entries):
+    def write_move_log(self, prefix, dest_dir, log_entries, log_dir=None):
+        """Write a move log into log_dir (the folder the files left; by default the
+        one on screen), where Restore From Log looks for it."""
+        log_dir = log_dir or self.image_directory
         if log_entries:
             timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
             log_name, n = f"move_log_{timestamp}.json", 1
             # Several moves can land in the same second; don't let one log replace another.
-            while os.path.exists(os.path.join(self.image_directory, log_name)):
+            while os.path.exists(os.path.join(log_dir, log_name)):
                 n += 1
                 log_name = f"move_log_{timestamp}_{n}.json"
-            log_path = os.path.join(self.image_directory, log_name)
+            log_path = os.path.join(log_dir, log_name)
             try:
                 with open(log_path, "w") as f:
                     json.dump({

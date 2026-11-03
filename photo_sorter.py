@@ -46,14 +46,16 @@ def set_jpeg_date_taken(path, date):
 
 # EXIF Orientation value that shows the image turned a further 90° clockwise.
 ROTATE_CW = {1: 6, 6: 3, 3: 8, 8: 1, 2: 7, 7: 4, 4: 5, 5: 2}
+ROTATE_CCW = {after: before for before, after in ROTATE_CW.items()}
 
 
-def rotate_jpeg_cw(path):
-    """Rotate a JPEG 90° clockwise by updating its EXIF Orientation tag, so the
+def rotate_jpeg(path, clockwise=True):
+    """Rotate a JPEG 90° by updating its EXIF Orientation tag, so the
     compressed image data is never re-encoded."""
     exif_dict = load_exif(path)
     current = exif_dict["0th"].get(piexif.ImageIFD.Orientation, 1)
-    exif_dict["0th"][piexif.ImageIFD.Orientation] = ROTATE_CW.get(current, 6)
+    turn = ROTATE_CW if clockwise else ROTATE_CCW
+    exif_dict["0th"][piexif.ImageIFD.Orientation] = turn.get(current, turn[1])
     write_exif(path, exif_dict)
 
 
@@ -791,6 +793,7 @@ class DragDropSorter(tk.Tk):
         self.bind_all("<ButtonRelease-1>", self.on_button_release)
         self.bind_all("<Delete>", self.delete_selected_thumbnails)        
         self.bind_all("<KeyPress-r>", self.rotate_thumbnail_under_cursor)
+        self.bind_all("<KeyPress-R>", lambda e: self.rotate_thumbnail_under_cursor(e, clockwise=False))
         self.bind_all("<Control-a>", self.select_all)
         self.bind_all("<Control-A>", self.select_all)
         self.bind_all("<Control-x>", self.cut_selection)
@@ -1425,7 +1428,7 @@ class DragDropSorter(tk.Tk):
             self.tooltip.destroy()
             self.tooltip = None
 
-    def rotate_thumbnail_under_cursor(self, event):
+    def rotate_thumbnail_under_cursor(self, event, clockwise=True):
         if isinstance(event.widget, tk.Entry):
             return  # typing an 'r' into the prefix or folder field
         widget = self.winfo_containing(*self.winfo_pointerxy())
@@ -1437,7 +1440,7 @@ class DragDropSorter(tk.Tk):
             self.loading_label.config(text=f"⚠️ Can only rotate JPEGs: {data['filename']}")
             return
         try:
-            rotate_jpeg_cw(path)
+            rotate_jpeg(path, clockwise)
             img = self.load_thumbnail(path)
         except Exception as e:
             print(f"⚠️ Could not rotate {data['filename']}: {e}")
@@ -1447,7 +1450,7 @@ class DragDropSorter(tk.Tk):
         data["label"].config(image=photo)
         data["label"].image = photo
         data["photo"] = photo
-        self.loading_label.config(text=f"↻ Rotated {data['filename']}")
+        self.loading_label.config(text=f"{'↻' if clockwise else '↺'} Rotated {data['filename']}")
 
     def handle_click_and_drag(self, event, label):
         self.canvas.focus_set()  # take focus from the entries so keys reach the grid

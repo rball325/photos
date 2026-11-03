@@ -876,16 +876,22 @@ class DragDropSorter(tk.Tk):
             print(f"⚠️ Could not save settings: {e}")
         self.destroy()
 
+    WHEEL_STEP = 3        # canvas units (yscrollincrement=10px) per wheel notch
+    FAST_WHEEL_STEP = 30  # with Ctrl held: about two rows per notch
+
+    def wheel_step(self, event):
+        return self.FAST_WHEEL_STEP if event.state & 0x0004 else self.WHEEL_STEP
+
     def on_mousewheel(self, event):
         self.hide_tooltip()  # the grid moves under the pointer without a <Leave>
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120) * self.wheel_step(event)), "units")
 
     def on_mousewheel_linux(self, event):
         self.hide_tooltip()
         if event.num == 4:
-            self.canvas.yview_scroll(-3, "units")
+            self.canvas.yview_scroll(-self.wheel_step(event), "units")
         elif event.num == 5:
-            self.canvas.yview_scroll(3, "units")
+            self.canvas.yview_scroll(self.wheel_step(event), "units")
 
     def scroll_grid_to(self, event, fraction):
         if isinstance(event.widget, tk.Entry):

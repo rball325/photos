@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import filedialog
 from tkinter import simpledialog
+from tkinter import ttk
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
 import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess
 import xml.etree.ElementTree as ET
@@ -150,6 +151,7 @@ def move_cached_thumb(old_path, new_path):
 
 
 TRASH_DIR = ".trash"
+TREE_PLACEHOLDER = "\x01"  # stand-in child that gives an unopened tree row its arrow
 LOG_FILE_RE = re.compile(r"(restored\d*_)?(rename|move)_log_.*\.json$")
 
 
@@ -585,6 +587,7 @@ class KeywordsWindow(tk.Toplevel):
             self.sorter.photo_root = os.path.normpath(folder)
             self.sorter.save_config()
             self.update_root_label()
+            self.sorter.refresh_tree()
 
     def path_keywords(self):
         """Folder names from just below the photo root down to the current folder,
@@ -738,7 +741,14 @@ class DragDropSorter(tk.Tk):
         menubar.add_command(label="EXIF", command=self.open_keywords_window)
         self.config(menu=menubar)
 
-        source_frame = tk.Frame(self)
+        # Folder tree on the left, everything else on the right; the sash can be dragged.
+        panes = tk.PanedWindow(self, orient="horizontal", sashwidth=5)
+        panes.pack(fill="both", expand=True)
+        panes.add(self.build_folder_tree(panes), width=220, minsize=120)
+        main = tk.Frame(panes)
+        panes.add(main, minsize=300)
+
+        source_frame = tk.Frame(main)
         
         self.folder_label = tk.Label(source_frame, text="Image Folder:")
         self.folder_label.pack(side="left")
@@ -754,7 +764,7 @@ class DragDropSorter(tk.Tk):
 
         source_frame.pack(pady=5)
 
-        prefix_frame = tk.Frame(self)
+        prefix_frame = tk.Frame(main)
         tk.Label(prefix_frame, text="Filename Prefix:").pack(side="left")
         self.prefix_entry = tk.Entry(prefix_frame)
         self.prefix_entry.pack(side="left", padx=5)
@@ -762,19 +772,19 @@ class DragDropSorter(tk.Tk):
         tk.Button(prefix_frame, text="Auto", command=self.auto_set_prefix).pack(side="left", padx=(5, 0))
         prefix_frame.pack(pady=5)
 
-        tk.Button(self, text="Preview Rename", command=self.preview_order).pack(pady=2)
-        tk.Button(self, text="Rename & Save Order", command=self.save_order).pack(pady=2)
-        tk.Button(self, text="Move & Rename To...", command=self.move_and_rename_to_folder).pack(pady=2)
-        tk.Button(self, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
+        tk.Button(main, text="Preview Rename", command=self.preview_order).pack(pady=2)
+        tk.Button(main, text="Rename & Save Order", command=self.save_order).pack(pady=2)
+        tk.Button(main, text="Move & Rename To...", command=self.move_and_rename_to_folder).pack(pady=2)
+        tk.Button(main, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
 
-        self.loading_label = tk.Label(self, text="Click 'Load' to load thumbnails")
+        self.loading_label = tk.Label(main, text="Click 'Load' to load thumbnails")
         self.loading_label.pack(pady=5)
 
         # Thumbnails are placed directly on the canvas as window items rather than
         # gridded into one inner Frame: X11 caps window size at 32767px, and a Frame
         # tall enough for ~1500 thumbnails made Tk abort with BadAlloc.
-        self.canvas = tk.Canvas(self)
-        self.scrollbar = tk.Scrollbar(self, command=self.canvas.yview)
+        self.canvas = tk.Canvas(main)
+        self.scrollbar = tk.Scrollbar(main, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
@@ -968,6 +978,148 @@ class DragDropSorter(tk.Tk):
         self.tk.call("set", "::tk::dialog::file::showHiddenBtn", 1)
         self.tk.call("set", "::tk::dialog::file::showHiddenVar", 0)
 
+    def build_folder_tree(self, parent):
+        """A folders-only tree of the photo root. Rows are keyed by their full path;
+        clicking one opens it, and photos or folders can be dropped onto it."""
+        frame = tk.Frame(parent)
+        self.tree = ttk.Treeview(frame, show="tree", selectmode="browse")
+        scrollbar = tk.Scrollbar(frame, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.tag_configure("drop", background="#9cc3ee")
+        self.tree.bind("<<TreeviewOpen>>", lambda e: self.fill_tree_node(self.tree.focus()))
+        self.tree.bind("<Button-1>", self.press_tree)
+        self._tree_drop_item = None
+        self.after_idle(self.refresh_tree)
+        return frame
+
+    def tree_root(self):
+        return os.path.normpath(self.photo_root or os.path.expanduser("~"))
+
+    @staticmethod
+    def subfolders(path):
+        try:
+            return sorted(e.name for e in os.scandir(path) if e.is_dir() and not e.name.startswith("."))
+        except OSError:
+            return []
+
+    def fill_tree_node(self, path):
+        """List a row's subfolders. Rows that have any get a placeholder child so
+        they show an expand arrow; their own children are listed when opened."""
+        if not path:
+            return
+        self.tree.delete(*self.tree.get_children(path))
+        for name in self.subfolders(path):
+            child = os.path.join(path, name)
+            self.tree.insert(path, "end", iid=child, text=f"📁 {name}")
+            if self.subfolders(child):
+                self.tree.insert(child, "end", iid=os.path.join(child, TREE_PLACEHOLDER))
+
+    def tree_items(self, parent=""):
+        for item in self.tree.get_children(parent):
+            yield item
+            yield from self.tree_items(item)
+
+    def refresh_tree(self):
+        """Rebuild the tree from disk, keeping open the rows that were open."""
+        opened = {i for i in self.tree_items() if self.tree.item(i, "open")}
+        self.tree.delete(*self.tree.get_children(""))
+        self._tree_drop_item = None
+        root = self.tree_root()
+        if not os.path.isdir(root):
+            return
+        self.tree.insert("", "end", iid=root, text=f"📁 {os.path.basename(root) or root}", open=True)
+        self.fill_tree_node(root)
+        for path in sorted(opened, key=len):  # parents before their children
+            if path != root and self.tree.exists(path):
+                self.tree.item(path, open=True)
+                self.fill_tree_node(path)
+        self.reveal_in_tree()
+
+    def reveal_in_tree(self):
+        """Open the rows down to the folder on screen and select it."""
+        root, current = self.tree_root(), os.path.normpath(self.image_directory or "")
+        if not self.tree.exists(root) or not (current == root or current.startswith(root + os.sep)):
+            self.tree.selection_set(())
+            return
+        path = root
+        for part in os.path.relpath(current, root).split(os.sep):
+            if part == ".":
+                break
+            if not self.tree.item(path, "open"):
+                self.tree.item(path, open=True)
+                self.fill_tree_node(path)
+            path = os.path.join(path, part)
+            if not self.tree.exists(path):
+                return
+        self.tree.selection_set(path)
+        self.tree.see(path)
+
+    def tree_folder_at(self, x_root, y_root):
+        """The tree row under a screen point, if any, as a folder path."""
+        x, y = x_root - self.tree.winfo_rootx(), y_root - self.tree.winfo_rooty()
+        if not (0 <= x < self.tree.winfo_width() and 0 <= y < self.tree.winfo_height()):
+            return None
+        item = self.tree.identify_row(y)
+        return item if item and os.path.basename(item) != TREE_PLACEHOLDER else None
+
+    def press_tree(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item or "indicator" in self.tree.identify_element(event.x, event.y):
+            return  # the expand arrow just opens or closes the row
+        self.hide_tooltip()
+        self._folder_drag = {"path": item, "label": None, "movable": item != self.tree_root(),
+                             "start": (event.x_root, event.y_root), "moved": False}
+
+    def drop_target_at(self, x_root, y_root):
+        """The folder under a screen point, as a full path: a tree row or a folder tile."""
+        item = self.tree_folder_at(x_root, y_root)
+        if item:
+            return item
+        tile = self.folder_at(x_root, y_root)
+        return os.path.normpath(os.path.join(self.image_directory, tile["name"])) if tile else None
+
+    def highlight_drop(self, path):
+        """Light up the folder tile and tree row for path (None clears them)."""
+        for data in self.folder_data:
+            here = os.path.normpath(os.path.join(self.image_directory, data["name"]))
+            data["label"].config(bg="#9cc3ee" if here == path else "#dde8f5")
+        if self._tree_drop_item != path:
+            if self._tree_drop_item and self.tree.exists(self._tree_drop_item):
+                self.tree.item(self._tree_drop_item, tags=())
+            if path and self.tree.exists(path):
+                self.tree.item(path, tags=("drop",))
+            self._tree_drop_item = path
+
+    def update_drop_highlight(self):
+        if self._folder_drag:
+            target = self.folder_drop_target()
+        else:
+            target = self.drop_target_at(*self._drag_pointer)
+            if target == os.path.normpath(self.image_directory):
+                target = None  # the photos are already there
+        self.highlight_drop(target)
+
+    def folder_path_changed(self, old_path, new_path):
+        """Follow a folder that was renamed or moved: remembered selections, the cut
+        list, and the folder on screen if it was that folder or inside it."""
+        old_path, new_path = os.path.normpath(old_path), os.path.normpath(new_path)
+        def follow(f):
+            f = os.path.normpath(f)
+            if f == old_path or f.startswith(old_path + os.sep):
+                return os.path.normpath(os.path.join(new_path, os.path.relpath(f, old_path)))
+            return f
+        self.saved_selections = {follow(f): names for f, names in self.saved_selections.items()}
+        self.cut_folder_moved(old_path, new_path)
+        if self.image_directory and follow(self.image_directory) != os.path.normpath(self.image_directory):
+            self.image_directory = follow(self.image_directory)
+            if self.grid_directory:
+                self.grid_directory = self.image_directory
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, self.image_directory)
+            self.save_config()
+
     def list_folders(self, entries):
         folders = [d for d in entries if os.path.isdir(os.path.join(self.image_directory, d))]
         parent = os.path.dirname(self.image_directory.rstrip(os.sep))
@@ -989,6 +1141,7 @@ class DragDropSorter(tk.Tk):
         # and any thumbnails it already queued via after() are discarded.
         self.load_generation += 1
         self.grid_directory = self.image_directory
+        self.refresh_tree()
         threading.Thread(target=self.load_thumbnails_thread, daemon=True,
                          args=(self.load_generation, self.image_directory, self.image_files)).start()
 
@@ -1018,6 +1171,7 @@ class DragDropSorter(tk.Tk):
         self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
         self.add_folder_widgets()
         self.redraw_grid()
+        self.refresh_tree()
 
     def show_grid_menu(self, event):
         if not self.grid_directory:
@@ -1105,13 +1259,7 @@ class DragDropSorter(tk.Tk):
         except OSError as e:
             messagebox.showerror("Rename Folder", f"Could not rename '{name}':\n{e}")
             return
-        # Keep remembered selections for the folder and anything below it.
-        old_norm = os.path.normpath(old_path)
-        self.saved_selections = {
-            (os.path.join(new_path, os.path.relpath(f, old_norm)) if f == old_norm or f.startswith(old_norm + os.sep) else f): names
-            for f, names in self.saved_selections.items()}
-        self.saved_selections = {os.path.normpath(f): n for f, n in self.saved_selections.items()}
-        self.cut_folder_moved(old_path, new_path)
+        self.folder_path_changed(old_path, new_path)
         # Logged as a move within this folder, so Restore From Log renames it back.
         self.write_move_log("", self.image_directory, [
             {"original": name, "final": new_name, "destination": self.image_directory}])
@@ -1145,18 +1293,12 @@ class DragDropSorter(tk.Tk):
             return self.folder_data[index]
         return None
 
-    def highlight_drop_folder(self, folder):
-        for data in self.folder_data:
-            data["label"].config(bg="#9cc3ee" if data is folder else "#dde8f5")
-
-    def move_to_subfolder(self, group, folder_name):
-        """Move photos dragged onto a folder tile, keeping their names. Logged like
-        Move & Rename, so Restore From Log puts them back."""
-        dest_dir = os.path.normpath(os.path.join(self.image_directory, folder_name))
+    def move_to_folder(self, group, dest_dir):
+        """Move photos dragged onto a folder tile or tree row, keeping their names.
+        Logged like Move & Rename, so Restore From Log puts them back."""
         moved = set(self.move_files(self.image_directory, [d["filename"] for d in group], dest_dir))
         self.remove_moved_from_grid([d for d in group if d["filename"] in moved])
-        shown = "the parent folder" if folder_name == ".." else folder_name
-        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {shown}.")
+        self.loading_label.config(text=f"Moved {len(moved)} file(s) to {os.path.basename(dest_dir)}.")
 
     def move_files(self, src_dir, names, dest_dir):
         """Move files between folders keeping their names, logged in src_dir so
@@ -1500,12 +1642,15 @@ class DragDropSorter(tk.Tk):
 
     def press_folder(self, event, name, label):
         self.hide_tooltip()
-        self._folder_drag = {"name": name, "label": label, "start": (event.x_root, event.y_root), "moved": False}
+        # The parent tile can be dropped onto, but not moved.
+        self._folder_drag = {"path": os.path.normpath(os.path.join(self.image_directory, name)),
+                             "label": label, "movable": name != "..",
+                             "start": (event.x_root, event.y_root), "moved": False}
 
     def handle_folder_drag_motion(self, event):
         drag = self._folder_drag
-        if drag["name"] == "..":
-            return  # the parent can be dropped onto, but not moved
+        if not drag["movable"]:
+            return
         if not drag["moved"]:
             dx, dy = event.x_root - drag["start"][0], event.y_root - drag["start"][1]
             if dx * dx + dy * dy < 36:
@@ -1514,17 +1659,22 @@ class DragDropSorter(tk.Tk):
             self.drag_overlay = tk.Toplevel(self)
             self.drag_overlay.overrideredirect(True)
             self.drag_overlay.attributes("-topmost", True)
-            tk.Label(self.drag_overlay, text=f"📁 {drag['name']}", bg="#dde8f5", bd=1, relief="solid",
+            tk.Label(self.drag_overlay, text=f"📁 {os.path.basename(drag['path'])}", bg="#dde8f5", bd=1, relief="solid",
                      padx=6, pady=4).pack()
         self.move_drag_cursor(event)
         self._drag_pointer = (event.x_root, event.y_root)
-        self.highlight_drop_folder(self.folder_drop_target())
+        self.update_drop_highlight()
         if not getattr(self, "_autoscroll_after", None):
             self.auto_scroll()
 
     def folder_drop_target(self):
-        target = self.folder_at(*self._drag_pointer)
-        return target if target and target["label"] is not self._folder_drag["label"] else None
+        """Where the dragged folder would go: not into itself, anything inside it,
+        or the folder it's already in."""
+        target = self.drop_target_at(*self._drag_pointer)
+        src = self._folder_drag["path"]
+        if not target or target == src or target.startswith(src + os.sep) or target == os.path.dirname(src):
+            return None
+        return target
 
     def finish_folder_drag(self, event):
         drag = self._folder_drag
@@ -1533,32 +1683,37 @@ class DragDropSorter(tk.Tk):
             target = self.folder_drop_target()
             self._folder_drag = None
             self.destroy_drag_cursor(event)
-            self.highlight_drop_folder(None)
+            self.highlight_drop(None)
             if target:
-                self.move_folder(drag["name"], target["name"])
+                self.move_folder(drag["path"], target)
             return
         self._folder_drag = None
-        over = self.folder_at(event.x_root, event.y_root)
-        if over and over["label"] is drag["label"]:
-            self.navigate_to_folder(drag["name"])
+        # A click (no drag) opens the folder, if released over the same tile or row.
+        if drag["label"]:
+            over = self.folder_at(event.x_root, event.y_root)
+            released_on_it = over and over["label"] is drag["label"]
+        else:
+            released_on_it = self.tree_folder_at(event.x_root, event.y_root) == drag["path"]
+        if released_on_it and drag["path"] != os.path.normpath(self.image_directory):
+            self.navigate_to_folder(drag["path"])
 
-    def move_folder(self, name, target):
-        """Move a subfolder into another folder tile (or up to the parent). Logged like
-        photo moves, so Restore From Log puts it back."""
-        dest_dir = os.path.normpath(os.path.join(self.image_directory, target))
+    def move_folder(self, src, dest_dir):
+        """Move a folder into another one. Logged like photo moves in the folder it
+        left, so Restore From Log there puts it back."""
+        name = os.path.basename(src)
         if os.path.exists(os.path.join(dest_dir, name)):
             messagebox.showerror("Move Folder", f"'{name}' already exists in {os.path.basename(dest_dir)}.")
             return
         try:
-            shutil.move(os.path.join(self.image_directory, name), dest_dir)
+            shutil.move(src, dest_dir)
         except Exception as e:
             messagebox.showerror("Move Folder", f"Could not move '{name}':\n{e}")
             return
-        self.cut_folder_moved(os.path.join(self.image_directory, name), os.path.join(dest_dir, name))
-        shown = "the parent folder" if target == ".." else target
-        self.loading_label.config(text=f"Moved folder '{name}' into {shown}.")
-        self.write_move_log("", dest_dir, [{"original": name, "final": name, "destination": dest_dir}])
+        self.folder_path_changed(src, os.path.join(dest_dir, name))
+        self.write_move_log("", dest_dir, [{"original": name, "final": name, "destination": dest_dir}],
+                            log_dir=os.path.dirname(src))
         self.refresh_folders()
+        self.loading_label.config(text=f"Moved folder '{name}' into {os.path.basename(dest_dir)}.")
 
     def handle_drag_motion(self, event, label):
         if not self._is_dragging:
@@ -1570,7 +1725,7 @@ class DragDropSorter(tk.Tk):
         self.create_drag_cursor(event)  # Show drag visual
         self.move_drag_cursor(event)   # Move overlay
         self._drag_pointer = (event.x_root, event.y_root)
-        self.highlight_drop_folder(self.folder_at(*self._drag_pointer))
+        self.update_drop_highlight()
         if not getattr(self, "_autoscroll_after", None):
             self.auto_scroll()
 
@@ -1617,7 +1772,7 @@ class DragDropSorter(tk.Tk):
     def finish_drag(self, event):
         self.canvas.unbind("<Motion>")
         self.destroy_drag_cursor(event)
-        self.highlight_drop_folder(None)
+        self.highlight_drop(None)
         if not self._is_dragging:
             return
         self._is_dragging = False
@@ -1626,9 +1781,10 @@ class DragDropSorter(tk.Tk):
         group = [d for d in self.image_data if d["label"] in self.selected_widgets]
         if not group:
             return
-        folder = self.folder_at(event.x_root, event.y_root)
-        if folder:
-            self.move_to_subfolder(group, folder["name"])
+        dest = self.drop_target_at(event.x_root, event.y_root)
+        if dest:
+            if dest != os.path.normpath(self.image_directory):
+                self.move_to_folder(group, dest)
             return
         # Hit-test against the fixed cell layout in canvas coordinates; widget
         # winfo_x/y aren't kept current for items scrolled out of view.
@@ -1962,6 +2118,15 @@ class DragDropSorter(tk.Tk):
         self._autoscroll_after = None
         if not (getattr(self, "_drag_pressed", False) or getattr(self, "_folder_drag", None)):
             return
+        px, py = self._drag_pointer[0] - self.tree.winfo_rootx(), self._drag_pointer[1] - self.tree.winfo_rooty()
+        if 0 <= px < self.tree.winfo_width():  # over the folder tree: scroll it instead
+            edge = 20
+            step = -1 if py < edge else 1 if py > self.tree.winfo_height() - edge else 0
+            if step:
+                self.tree.yview_scroll(step, "units")
+                self.update_drop_highlight()
+                self._autoscroll_after = self.after(80, self.auto_scroll)
+            return
         canvas_height = self.canvas.winfo_height()
         distance_from_top = self._drag_pointer[1] - self.canvas.winfo_rooty()
         distance_from_bottom = canvas_height - distance_from_top
@@ -1975,7 +2140,7 @@ class DragDropSorter(tk.Tk):
         if speed == 0:
             return
         self.canvas.yview_scroll(speed, "units")
-        self.highlight_drop_folder(self.folder_drop_target() if self._folder_drag else self.folder_at(*self._drag_pointer))
+        self.update_drop_highlight()
         self._autoscroll_after = self.after(50, self.auto_scroll)
 
 if __name__ == "__main__":

@@ -151,6 +151,7 @@ def move_cached_thumb(old_path, new_path):
 
 
 TRASH_DIR = ".trash"
+VIEW_FILE = ".photo_sorter_view.json"  # per-folder scroll positions of the grid and tree
 TREE_PLACEHOLDER = "\x01"  # stand-in child that gives an unopened tree row its arrow
 LOG_FILE_RE = re.compile(r"(restored\d*_)?(rename|move)_log_.*\.json$")
 
@@ -727,6 +728,7 @@ class DragDropSorter(tk.Tk):
         self._is_dragging = False
         self._folder_drag = None
         self.cut_files = None  # (folder, filenames) waiting for Ctrl-V
+        self.saved_view = {}  # scroll positions read for the folder being loaded
 
         self.load_config()
         self.hide_hidden_files_in_dialogs()
@@ -875,7 +877,34 @@ class DragDropSorter(tk.Tk):
         self.clear_grid()
         self.start_thumbnail_loading()
 
+    def view_file(self, folder):
+        return os.path.join(folder, VIEW_FILE)
+
+    def save_view_state(self):
+        """Remember where the grid and tree are scrolled, in a hidden file in the
+        folder on screen. Skipped mid-load, when the grid isn't all there yet."""
+        folder = self.grid_directory
+        if not folder or not hasattr(self, "on_disk_order") or not os.path.isdir(folder):
+            return
+        state = {"grid": round(self.canvas.yview()[0], 5), "tree": round(self.tree.yview()[0], 5)}
+        if self.read_view_state(folder) == state:
+            return  # unchanged: leave the file (and the folder's mtime) alone
+        try:
+            with open(self.view_file(folder), "w") as f:
+                json.dump(state, f)
+        except OSError as e:
+            print(f"⚠️ Could not save scroll position: {e}")
+
+    def read_view_state(self, folder):
+        try:
+            with open(self.view_file(folder)) as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     def clear_grid(self):
+        self.save_view_state()
         self.hide_tooltip()
         self.canvas.delete("all")
         for widget in self.canvas.winfo_children():
@@ -906,6 +935,7 @@ class DragDropSorter(tk.Tk):
     def on_app_close(self):
         if not self.check_unsaved_changes():
             return
+        self.save_view_state()
         try:
             self.save_config()
         except Exception as e:
@@ -990,6 +1020,7 @@ class DragDropSorter(tk.Tk):
         self.tree.tag_configure("drop", background="#9cc3ee")
         self.tree.bind("<<TreeviewOpen>>", lambda e: self.fill_tree_node(self.tree.focus()))
         self.tree.bind("<Button-1>", self.press_tree)
+        self.tree.bind("<Button-3>", self.show_tree_menu)
         self._tree_drop_item = None
         self.after_idle(self.refresh_tree)
         return frame
@@ -1142,6 +1173,9 @@ class DragDropSorter(tk.Tk):
         self.load_generation += 1
         self.grid_directory = self.image_directory
         self.refresh_tree()
+        self.saved_view = self.read_view_state(self.image_directory)
+        if "tree" in self.saved_view:
+            self.after_idle(self.tree.yview_moveto, self.saved_view["tree"])
         threading.Thread(target=self.load_thumbnails_thread, daemon=True,
                          args=(self.load_generation, self.image_directory, self.image_files)).start()
 
@@ -1192,22 +1226,49 @@ class DragDropSorter(tk.Tk):
                 self.grid_menu.add_command(label=f"Paste {count} Photo(s) Here", accelerator="Ctrl+V",
                                            command=self.paste_cut)
         if folder and folder["name"] != "..":
-            self.grid_menu.add_command(label=f"Rename Folder '{folder['name']}'...",
-                                       command=lambda n=folder["name"]: self.rename_folder(n))
-            self.grid_menu.add_command(label=f"Delete Folder '{folder['name']}'...",
-                                       command=lambda n=folder["name"]: self.delete_folder(n))
+            self.add_folder_commands(os.path.join(self.image_directory, folder["name"]))
         self.grid_menu.tk_popup(event.x_root, event.y_root)
 
-    def delete_folder(self, name):
-        """Move a folder into .trash, asking first if it or any subfolder holds files
-        other than thumbnail caches and rename/move logs."""
-        path = os.path.join(self.image_directory, name)
+    def add_folder_commands(self, path):
+        name = os.path.basename(path)
+        self.grid_menu.add_command(label=f"Rename Folder '{name}'...", command=lambda: self.rename_folder(path))
+        self.grid_menu.add_command(label=f"Delete Folder '{name}'...", command=lambda: self.delete_folder(path))
+
+    def show_tree_menu(self, event):
+        """The grid's right-click commands, acting on the tree row clicked."""
+        path = self.tree.identify_row(event.y)
+        if not path or os.path.basename(path) == TREE_PLACEHOLDER:
+            return
+        name = os.path.basename(path) or path
+        here = path == os.path.normpath(self.image_directory)
+        self.grid_menu.delete(0, "end")
+        self.grid_menu.add_command(label=f"New Folder in '{name}'...", command=lambda: self.create_folder(path))
+        if self.selected_widgets:
+            self.grid_menu.add_command(label=f"Cut {len(self.selected_widgets)} Photo(s)", accelerator="Ctrl+X",
+                                       command=self.cut_selection)
+        if self.cut_files:
+            count = len(self.cut_files[1])
+            self.grid_menu.add_command(label=f"Paste {count} Photo(s) " + ("Here" if here else f"into '{name}'"),
+                                       command=lambda: self.paste_cut(folder_name=path))
+        if path != self.tree_root():
+            self.add_folder_commands(path)
+        self.grid_menu.tk_popup(event.x_root, event.y_root)
+
+    def delete_folder(self, path):
+        """Move a folder into .trash in the folder holding it, asking first if it or
+        any subfolder holds files other than thumbnail caches and rename/move logs."""
+        path = os.path.normpath(path)
+        parent, name = os.path.dirname(path), os.path.basename(path)
+        current = os.path.normpath(self.image_directory)
+        showing_it = current == path or current.startswith(path + os.sep)
+        if showing_it and not self.check_unsaved_changes():
+            return
         photos = folders = others = 0
         for dirpath, dirnames, filenames in os.walk(path):
             dirnames[:] = [d for d in dirnames if d != THUMB_DIR]
             folders += len(dirnames)
             for f in filenames:
-                if LOG_FILE_RE.match(f):
+                if LOG_FILE_RE.match(f) or f == VIEW_FILE:
                     continue  # this app's own logs, including retired restored_* ones
                 if f.lower().endswith((".jpg", ".jpeg", ".png")):
                     photos += 1
@@ -1224,14 +1285,23 @@ class DragDropSorter(tk.Tk):
                     icon="warning", default="no"):
                 return
         try:
-            final = move_to_trash(self.image_directory, name)
+            final = move_to_trash(parent, name)
         except Exception as e:
             messagebox.showerror("Delete Folder", f"Could not move '{name}' to {TRASH_DIR}:\n{e}")
             return
-        trash = os.path.join(self.image_directory, TRASH_DIR)
-        self.write_move_log("", trash, [{"original": name, "final": final, "destination": trash}])
+        trash = os.path.join(parent, TRASH_DIR)
+        self.cut_folder_moved(path, os.path.join(trash, final))
+        self.write_move_log("", trash, [{"original": name, "final": final, "destination": trash}], log_dir=parent)
+        if showing_it:  # the folder on screen went with it: show the one that held it
+            self.image_directory = parent
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, parent)
+            self.save_config()
+            self.clear_grid()
+            self.start_thumbnail_loading()
+        else:
+            self.refresh_folders()
         self.loading_label.config(text=f"Moved folder '{name}' to {TRASH_DIR}.")
-        self.refresh_folders()
 
     def ask_folder_name(self, title, initial=""):
         """Ask for a folder name; None if cancelled or not a usable name."""
@@ -1244,12 +1314,13 @@ class DragDropSorter(tk.Tk):
             return None
         return name
 
-    def rename_folder(self, name):
+    def rename_folder(self, old_path):
+        old_path = os.path.normpath(old_path)
+        parent, name = os.path.dirname(old_path), os.path.basename(old_path)
         new_name = self.ask_folder_name("Rename Folder", name)
         if not new_name or new_name == name:
             return
-        old_path = os.path.join(self.image_directory, name)
-        new_path = os.path.join(self.image_directory, new_name)
+        new_path = os.path.join(parent, new_name)
         # Checked by hand: os.rename would silently replace an empty folder of that name.
         if os.path.exists(new_path) and not os.path.samefile(old_path, new_path):
             messagebox.showerror("Rename Folder", f"'{new_name}' already exists.")
@@ -1260,24 +1331,28 @@ class DragDropSorter(tk.Tk):
             messagebox.showerror("Rename Folder", f"Could not rename '{name}':\n{e}")
             return
         self.folder_path_changed(old_path, new_path)
-        # Logged as a move within this folder, so Restore From Log renames it back.
-        self.write_move_log("", self.image_directory, [
-            {"original": name, "final": new_name, "destination": self.image_directory}])
+        # Logged as a move within the folder holding it, so Restore From Log there renames it back.
+        self.write_move_log("", parent, [{"original": name, "final": new_name, "destination": parent}],
+                            log_dir=parent)
         self.loading_label.config(text=f"Renamed folder '{name}' to '{new_name}'.")
         self.refresh_folders()
 
-    def create_folder(self):
+    def create_folder(self, parent=None):
         name = self.ask_folder_name("New Folder")
         if not name:
             return
+        parent = parent or self.image_directory
         try:
-            os.mkdir(os.path.join(self.image_directory, name))
+            os.mkdir(os.path.join(parent, name))
         except FileExistsError:
             messagebox.showerror("New Folder", f"'{name}' already exists.")
             return
         except OSError as e:
             messagebox.showerror("New Folder", f"Could not create '{name}':\n{e}")
             return
+        if self.tree.exists(parent) and not self.tree.item(parent, "open"):
+            self.tree.item(parent, open=True)  # show the new folder
+            self.fill_tree_node(parent)
         self.refresh_folders()
 
     def folder_at(self, x_root, y_root):
@@ -1350,7 +1425,8 @@ class DragDropSorter(tk.Tk):
             self.cut_files = (src_dir, names)
 
     def paste_cut(self, event=None, folder_name=None):
-        """Move the cut photos into the folder on screen, or into folder_name below it."""
+        """Move the cut photos into the folder on screen, or into folder_name (below it,
+        or a full path from the tree)."""
         if event is not None and (isinstance(event.widget, tk.Entry) or event.widget.winfo_toplevel() is not self):
             return
         if not self.cut_files:
@@ -1385,7 +1461,7 @@ class DragDropSorter(tk.Tk):
             self.start_thumbnail_loading()
             print(f"Pasted {len(moved)} photo(s) from {src_dir}.{note}")
         else:
-            shown = "the parent folder" if folder_name == ".." else folder_name
+            shown = "the parent folder" if folder_name == ".." else os.path.basename(dest_dir)
             self.loading_label.config(text=f"Moved {len(moved)} photo(s) to {shown}.{note}")
 
     def load_thumbnails_thread(self, generation, directory, files):
@@ -1424,6 +1500,10 @@ class DragDropSorter(tk.Tk):
             return
         self.set_on_disk_order()
         self.restore_selection()
+        # The grid is only its full height once loaded; don't undo a scroll made meanwhile.
+        if "grid" in self.saved_view and self.canvas.yview()[0] == 0:
+            self.update_idletasks()
+            self.canvas.yview_moveto(self.saved_view["grid"])
         self.loading_label.config(text=f"✅ {self.total_files} thumbnails loaded.")
 
     def restore_selection(self):
@@ -1456,7 +1536,7 @@ class DragDropSorter(tk.Tk):
         item = self.canvas.create_window(*self.cell_center(row, column), window=lbl)
 
         lbl.bind("<Button-1>", lambda e, l=lbl: self.handle_click_and_drag(e, l))
-        lbl.bind("<Double-Button-1>", lambda e, f=file: self.open_image_viewer(f))
+        lbl.bind("<Double-Button-1>", lambda e, l=lbl: self.open_image_viewer(l))
         lbl.bind("<Enter>", lambda e, l=lbl: self.schedule_tooltip(l))
         lbl.bind("<Leave>", self.hide_tooltip)
         lbl.bind("<Button-3>", self.show_grid_menu)
@@ -1485,9 +1565,11 @@ class DragDropSorter(tk.Tk):
         selected = [d for d in self.image_data if d["label"] in self.selected_widgets]
         return (selected, True) if selected else (list(self.image_data), False)
 
-    def open_image_viewer(self, filename):
-        path = os.path.join(self.image_directory, filename)
-        ImageViewer(self, path)
+    def open_image_viewer(self, label):
+        # Look up the filename now rather than at load time: renames change it.
+        data = next((d for d in self.image_data if d["label"] is label), None)
+        if data:
+            ImageViewer(self, os.path.join(self.image_directory, data["filename"]))
 
     def delete_selected_thumbnails(self, event=None):
         if not self.selected_widgets:

@@ -4,7 +4,7 @@ from tkinter import filedialog
 from tkinter import simpledialog
 from tkinter import ttk
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
-import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess
+import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess, time
 import xml.etree.ElementTree as ET
 import piexif
 
@@ -664,6 +664,7 @@ class DragDropSorter(tk.Tk):
                 self.keyword_highlights = config.get("keyword_highlights", [])
                 self.photo_root = config.get("photo_root", "")
                 self.keywords_from_path = config.get("keywords_from_path", False)
+                self.tree_open = config.get("tree_open", [])
         else:
             self.image_directory = ""
             self.move_destination = ""
@@ -673,6 +674,7 @@ class DragDropSorter(tk.Tk):
             self.keyword_highlights = []
             self.photo_root = ""
             self.keywords_from_path = False
+            self.tree_open = []
         if not self.photo_root and os.path.isdir(os.path.expanduser("~/Photos")):
             self.photo_root = os.path.expanduser("~/Photos")
 
@@ -700,6 +702,7 @@ class DragDropSorter(tk.Tk):
                 "keyword_highlights": self.keyword_highlights,
                 "photo_root": self.photo_root,
                 "keywords_from_path": self.keywords_from_path,
+                "tree_open": self.open_tree_folders(),
             }, f)
 
     def __init__(self):
@@ -710,7 +713,7 @@ class DragDropSorter(tk.Tk):
         self.thumb_size = (120, 120)
         self.cell_size = 140  # thumb + selection border + padding
         self.image_directory = ""
-        self.max_columns = 6
+        self.max_columns = 6  # follows the grid's width; see relayout_columns
         self.image_data = []
         self.image_files = []
         self.folder_data = []
@@ -793,6 +796,7 @@ class DragDropSorter(tk.Tk):
         self.canvas.configure(yscrollincrement=10)
         self.grid_menu = tk.Menu(self, tearoff=0)
         self.canvas.bind("<Button-3>", self.show_grid_menu)
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)       # Windows & macOS
         self.canvas.bind_all("<Button-4>", self.on_mousewheel_linux)   # Linux scroll up
@@ -1022,6 +1026,8 @@ class DragDropSorter(tk.Tk):
         self.tree.bind("<Button-1>", self.press_tree)
         self.tree.bind("<Button-3>", self.show_tree_menu)
         self._tree_drop_item = None
+        self._status_before_drop = None
+        self._tree_edge_since = None
         self.after_idle(self.refresh_tree)
         return frame
 
@@ -1052,15 +1058,24 @@ class DragDropSorter(tk.Tk):
             yield item
             yield from self.tree_items(item)
 
+    def open_tree_folders(self):
+        """Folders expanded in the tree; saved in the config so they reopen next time."""
+        if not hasattr(self, "tree") or not self.tree.get_children(""):
+            return self.tree_open  # tree not built yet: keep what was saved
+        return sorted(i for i in self.tree_items() if self.tree.item(i, "open"))
+
     def refresh_tree(self):
-        """Rebuild the tree from disk, keeping open the rows that were open."""
-        opened = {i for i in self.tree_items() if self.tree.item(i, "open")}
+        """Rebuild the tree from disk, keeping open the rows that were open (on the
+        first build, the ones saved in the config)."""
+        opened = set(self.open_tree_folders())
         self.tree.delete(*self.tree.get_children(""))
         self._tree_drop_item = None
         root = self.tree_root()
         if not os.path.isdir(root):
             return
-        self.tree.insert("", "end", iid=root, text=f"📁 {os.path.basename(root) or root}", open=True)
+        # The root starts open, and stays closed only if it was closed by hand.
+        self.tree.insert("", "end", iid=root, text=f"📁 {os.path.basename(root) or root}",
+                         open=root in opened or not opened)
         self.fill_tree_node(root)
         for path in sorted(opened, key=len):  # parents before their children
             if path != root and self.tree.exists(path):
@@ -1122,6 +1137,16 @@ class DragDropSorter(tk.Tk):
             if path and self.tree.exists(path):
                 self.tree.item(path, tags=("drop",))
             self._tree_drop_item = path
+            # Name the target in the status line, so it's clear where a drop will land.
+            if path:
+                if self._status_before_drop is None:
+                    self._status_before_drop = self.loading_label.cget("text")
+                shown = os.path.relpath(path, self.tree_root())
+                shown = os.path.basename(path) if shown.startswith("..") else shown
+                self.loading_label.config(text=f"Drop into: {shown}")
+            elif self._status_before_drop is not None:
+                self.loading_label.config(text=self._status_before_drop)
+                self._status_before_drop = None
 
     def update_drop_highlight(self):
         if self._folder_drag:
@@ -1166,7 +1191,7 @@ class DragDropSorter(tk.Tk):
         self.total_files = len(self.image_files)
         self.grid_row_offset = 0
         if self.folder_names:
-            self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
+            self.grid_row_offset = self.folder_rows()
             self.add_folder_widgets()
         # Bump the generation so a loader still running for a previous folder stops,
         # and any thumbnails it already queued via after() are discarded.
@@ -1195,6 +1220,35 @@ class DragDropSorter(tk.Tk):
             self.folder_data.append({"name": name, "label": lbl, "item": item})
         self.update_scrollregion()
 
+    def folder_rows(self):
+        return (len(self.folder_names) + self.max_columns - 1) // self.max_columns
+
+    def on_canvas_resize(self, event):
+        # Resizing sends a burst of these; lay out once it settles.
+        if getattr(self, "_relayout_after", None):
+            self.after_cancel(self._relayout_after)
+        self._relayout_after = self.after(80, self.relayout_columns)
+
+    def relayout_columns(self):
+        """Fit as many columns as the grid's width holds, keeping the photo at the
+        top of the view in view."""
+        self._relayout_after = None
+        columns = max(1, self.canvas.winfo_width() // self.cell_size)
+        if columns == self.max_columns:
+            return
+        top_row = int(self.canvas.canvasy(0) // self.cell_size) - self.grid_row_offset
+        first_visible = max(0, top_row) * self.max_columns
+        self.max_columns = columns
+        if self.folder_names:
+            self.grid_row_offset = self.folder_rows()
+        for idx, data in enumerate(self.folder_data):
+            self.canvas.coords(data["item"], *self.cell_center(idx // columns, idx % columns))
+        self.redraw_grid()
+        if top_row > 0 and self.image_data:
+            row = self.grid_row_offset + min(first_visible, len(self.image_data) - 1) // columns
+            height = max(1, (self.grid_row_offset + (len(self.image_data) + columns - 1) // columns) * self.cell_size)
+            self.canvas.yview_moveto(row * self.cell_size / height)
+
     def refresh_folders(self):
         """Rebuild the folder tiles after one is added, shifting the photos to fit."""
         for data in self.folder_data:
@@ -1202,7 +1256,7 @@ class DragDropSorter(tk.Tk):
             data["label"].destroy()
         entries = sorted(e for e in os.listdir(self.image_directory) if not e.startswith("."))
         self.folder_names = self.list_folders(entries)
-        self.grid_row_offset = (len(self.folder_names) + self.max_columns - 1) // self.max_columns
+        self.grid_row_offset = self.folder_rows()
         self.add_folder_widgets()
         self.redraw_grid()
         self.refresh_tree()
@@ -1256,7 +1310,8 @@ class DragDropSorter(tk.Tk):
 
     def delete_folder(self, path):
         """Move a folder into .trash in the folder holding it, asking first if it or
-        any subfolder holds files other than thumbnail caches and rename/move logs."""
+        any subfolder holds files other than thumbnail caches, rename/move logs and
+        photos already in a .trash of its own."""
         path = os.path.normpath(path)
         parent, name = os.path.dirname(path), os.path.basename(path)
         current = os.path.normpath(self.image_directory)
@@ -1265,7 +1320,8 @@ class DragDropSorter(tk.Tk):
             return
         photos = folders = others = 0
         for dirpath, dirnames, filenames in os.walk(path):
-            dirnames[:] = [d for d in dirnames if d != THUMB_DIR]
+            # Thumbnail caches and photos already trashed (which go along) aren't contents.
+            dirnames[:] = [d for d in dirnames if d not in (THUMB_DIR, TRASH_DIR)]
             folders += len(dirnames)
             for f in filenames:
                 if LOG_FILE_RE.match(f) or f == VIEW_FILE:
@@ -2199,16 +2255,27 @@ class DragDropSorter(tk.Tk):
         grid, repeating on a timer so the pointer needn't keep moving."""
         self._autoscroll_after = None
         if not (getattr(self, "_drag_pressed", False) or getattr(self, "_folder_drag", None)):
+            self._tree_edge_since = None
             return
         px, py = self._drag_pointer[0] - self.tree.winfo_rootx(), self._drag_pointer[1] - self.tree.winfo_rooty()
         if 0 <= px < self.tree.winfo_width():  # over the folder tree: scroll it instead
-            edge = 20
+            # Only a thin strip at each end scrolls, and only after the pointer has
+            # rested there a moment, slowly: a quick scroll under a pointer aimed at
+            # the last visible row would carry the drop into some other folder.
+            edge = 10
             step = -1 if py < edge else 1 if py > self.tree.winfo_height() - edge else 0
-            if step:
+            if not step:
+                self._tree_edge_since = None
+                return
+            now = time.monotonic()
+            if self._tree_edge_since is None:
+                self._tree_edge_since = now
+            if now - self._tree_edge_since >= 0.6:
                 self.tree.yview_scroll(step, "units")
                 self.update_drop_highlight()
-                self._autoscroll_after = self.after(80, self.auto_scroll)
+            self._autoscroll_after = self.after(150, self.auto_scroll)
             return
+        self._tree_edge_since = None
         canvas_height = self.canvas.winfo_height()
         distance_from_top = self._drag_pointer[1] - self.canvas.winfo_rooty()
         distance_from_bottom = canvas_height - distance_from_top

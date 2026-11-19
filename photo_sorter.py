@@ -4,7 +4,7 @@ from tkinter import filedialog
 from tkinter import simpledialog
 from tkinter import ttk
 from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
-import os, json, threading, datetime, calendar, re, shutil, math, stat, subprocess, time
+import os, json, threading, bisect, datetime, calendar, re, shutil, math, stat, subprocess, time
 import xml.etree.ElementTree as ET
 import piexif
 
@@ -650,6 +650,392 @@ class KeywordsWindow(tk.Toplevel):
             print(summary)
 
 
+TIMELINE_EXTENSIONS = (".jpg", ".jpeg", ".png")
+
+
+def timeline_date(path):
+    """When a photo was taken, for the timeline: the YYYY-MM-DD_ prefix the sorter
+    names files with, else the EXIF date, else a date in the folder names.
+    Returns a datetime.date or None."""
+    date = parse_date_from_prefix(os.path.basename(path))
+    if date:
+        return date
+    if path.lower().endswith(JPEG_EXTENSIONS):
+        try:
+            with Image.open(path) as img:
+                exif = img.getexif()
+                raw = exif.get_ifd(0x8769).get(36867) or exif.get(306)  # DateTimeOriginal, DateTime
+            if raw:
+                y, m, d = (int(p) for p in str(raw).strip()[:10].split(":"))
+                return datetime.date(y, m, d)
+        except Exception:
+            pass
+    return infer_date_from_path(os.path.dirname(path))
+
+
+class TimelineWindow(tk.Toplevel):
+    """Every photo under a folder (searched recursively), in date order, under a
+    heading for each month. Thumbnails are drawn only for the rows near the view,
+    so a whole library of tens of thousands of photos scrolls without trouble."""
+
+    HEADER_HEIGHT = 34
+    MARGIN_ROWS = 4  # rows drawn beyond the view, above and below
+
+    def __init__(self, sorter, folder):
+        super().__init__(sorter)
+        self.sorter = sorter
+        self.title("Timeline")
+        self.geometry("1000x760")
+        self.cell = sorter.cell_size
+        self.items = []         # [{"path", "date"}] in timeline order
+        self.rows = []          # [(y, first_item, end_item)] photo rows, top to bottom
+        self.row_tops = []      # the y of each row, for bisecting
+        self.row_firsts = []    # the first item of each row, for bisecting
+        self.year_tops = []     # [(year label, y)] for the year list
+        self.closed = False
+        self.headers = []       # [(y, label, year)]
+        self.columns = 0
+        self.drawn = {}         # row index -> canvas item ids
+        self.photos = {}        # item index -> PhotoImage (only near the view)
+        self.cell_items = {}    # item index -> canvas image id, while its row is drawn
+        self.wanted = []        # item indexes waiting for a thumbnail, most urgent last
+        self.wanted_lock = threading.Condition()
+        self.generation = 0
+        self._render_after = None
+
+        bar = tk.Frame(self)
+        tk.Label(bar, text="Folder:").pack(side="left")
+        self.folder_entry = tk.Entry(bar, width=20)
+        self.folder_entry.insert(0, folder)
+        self.folder_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.folder_entry.bind("<Return>", lambda e: self.load())
+        tk.Button(bar, text="Load", command=self.load).pack(side="left")
+        tk.Button(bar, text="Browse...", command=self.browse).pack(side="left", padx=(4, 0))
+        bar.pack(side="top", fill="x", padx=6, pady=5)
+
+        self.status = tk.Label(self, anchor="w")
+        self.status.pack(side="bottom", fill="x", padx=6, pady=(0, 3))
+
+        body = tk.PanedWindow(self, orient="horizontal", sashwidth=5)
+        body.pack(fill="both", expand=True)
+        years = tk.Frame(body)
+        self.year_list = tk.Listbox(years, activestyle="none", exportselection=False, width=12)
+        year_scroll = tk.Scrollbar(years, command=self.year_list.yview)
+        self.year_list.configure(yscrollcommand=year_scroll.set)
+        year_scroll.pack(side="right", fill="y")
+        self.year_list.pack(side="left", fill="both", expand=True)
+        self.year_list.bind("<<ListboxSelect>>", self.jump_to_year)
+        body.add(years, width=110, minsize=70)
+
+        view = tk.Frame(body)
+        self.canvas = tk.Canvas(view, bg="white", highlightthickness=0)
+        scrollbar = tk.Scrollbar(view, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=lambda *a: (scrollbar.set(*a), self.schedule_render()),
+                              yscrollincrement=10)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        body.add(view, minsize=300)
+
+        self.canvas.bind("<Configure>", lambda e: self.schedule_render(relayout=True))
+        self.canvas.bind("<Double-Button-1>", self.open_viewer)
+        self.canvas.bind("<Button-3>", self.show_menu)
+        self.canvas.bind("<Motion>", self.show_path)
+        self.menu = tk.Menu(self, tearoff=0)
+
+        # The sorter binds these application-wide to act on its own grid; handle
+        # them here first and stop them reaching it.
+        self.bind("<MouseWheel>", lambda e: self.scroll(int(-e.delta / 120) * self.wheel_step(e)))
+        self.bind("<Button-4>", lambda e: self.scroll(-self.wheel_step(e)))
+        self.bind("<Button-5>", lambda e: self.scroll(self.wheel_step(e)))
+        self.bind("<Prior>", lambda e: self.page(-1))
+        self.bind("<Next>", lambda e: self.page(1))
+        self.bind("<Home>", lambda e: self.moveto(e, 0.0))
+        self.bind("<End>", lambda e: self.moveto(e, 1.0))
+        for key in ("<Delete>", "<KeyPress-r>", "<KeyPress-R>", "<Control-x>", "<Control-X>",
+                    "<Control-v>", "<Control-V>"):
+            self.bind(key, lambda e: "break")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        threading.Thread(target=self.thumbnail_worker, daemon=True).start()
+        self.load()
+
+    # --- scanning -------------------------------------------------------------
+
+    def browse(self):
+        initial = self.folder_entry.get().strip()
+        kwargs = {"initialdir": initial} if initial and os.path.isdir(initial) else {}
+        folder = filedialog.askdirectory(parent=self, title="Timeline folder", **kwargs)
+        if folder:
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, folder)
+            self.load()
+
+    def load(self):
+        folder = self.folder_entry.get().strip()
+        if not os.path.isdir(folder):
+            self.status.config(text=f"⚠️ Not a folder: {folder}")
+            return
+        self.generation += 1
+        self.title(f"Timeline — {folder}")
+        self.items, self.rows, self.row_tops, self.headers = [], [], [], []
+        self.clear_drawing()
+        self.year_list.delete(0, tk.END)
+        self.canvas.configure(scrollregion=(0, 0, 1, 1))
+        self.status.config(text="Scanning...")
+        threading.Thread(target=self.scan, args=(self.generation, folder), daemon=True).start()
+
+    def scan(self, generation, folder):
+        paths = []
+        for directory, dirs, files in os.walk(folder):
+            if generation != self.generation:
+                return
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            paths += [os.path.join(directory, f) for f in sorted(files)
+                      if not f.startswith(".") and f.lower().endswith(TIMELINE_EXTENSIONS)]
+        items = []
+        for n, path in enumerate(paths):
+            if generation != self.generation:
+                return
+            items.append({"path": path, "date": timeline_date(path)})
+            if n % 500 == 0:
+                self.after(0, self.scan_progress, generation, n, len(paths))
+        # Dated photos oldest first, then any with no date at all.
+        items.sort(key=lambda d: (d["date"] is None, d["date"] or datetime.date.min, d["path"]))
+        self.after(0, self.scan_done, generation, items)
+
+    def scan_progress(self, generation, done, total):
+        if generation == self.generation:
+            self.status.config(text=f"Reading dates: {done} of {total}...")
+
+    def scan_done(self, generation, items):
+        if generation != self.generation:
+            return
+        self.items = items
+        self.columns = 0  # forces a layout
+        self.render()
+        undated = sum(1 for d in items if d["date"] is None)
+        self.status.config(text=f"{len(items)} photo(s)" + (f", {undated} with no date" if undated else "")
+                           + ". Double-click to view; right-click to open the folder.")
+
+    # --- layout and drawing ---------------------------------------------------
+
+    def layout(self):
+        """Lay the photos out in rows under a heading per month."""
+        self.columns = max(1, (self.canvas.winfo_width() - 10) // self.cell)
+        self.rows, self.headers = [], []
+        y, start = 0, 0
+        while start < len(self.items):
+            date = self.items[start]["date"]
+            month = (date.year, date.month) if date else None
+            end = start
+            while end < len(self.items) and self.month_of(end) == month:
+                end += 1
+            label = (datetime.date(*month, 1).strftime("%B %Y") if month else "No date") + f"   ({end - start})"
+            self.headers.append((y, label, month[0] if month else None))
+            y += self.HEADER_HEIGHT
+            for first in range(start, end, self.columns):
+                self.rows.append((y, first, min(first + self.columns, end)))
+                y += self.cell
+            start = end
+        self.row_tops = [r[0] for r in self.rows]
+        self.row_firsts = [r[1] for r in self.rows]
+        self.canvas.configure(scrollregion=(0, 0, self.columns * self.cell + 10, max(y, 1)))
+
+        self.year_list.delete(0, tk.END)
+        self.year_tops = []
+        for top, _, year in self.headers:
+            label = str(year) if year else "No date"
+            if not self.year_tops or self.year_tops[-1][0] != label:
+                self.year_tops.append((label, top))
+                self.year_list.insert(tk.END, label)
+
+    def month_of(self, i):
+        date = self.items[i]["date"]
+        return (date.year, date.month) if date else None
+
+    def clear_drawing(self):
+        self.canvas.delete("all")
+        self.drawn.clear()
+        self.cell_items.clear()
+        self.photos.clear()
+        with self.wanted_lock:
+            self.wanted.clear()
+
+    def schedule_render(self, relayout=False):
+        if relayout:
+            self.columns = -1
+        if not self._render_after:
+            self._render_after = self.after(15, self.render)
+
+    def render(self):
+        """Draw the rows in and near the view, drop those far from it, and queue
+        thumbnails for the photos that are showing."""
+        self._render_after = None
+        if not self.items:
+            return
+        width_columns = max(1, (self.canvas.winfo_width() - 10) // self.cell)
+        if self.columns != width_columns:
+            # Keep the same photo at the top across a change in columns.
+            anchor = self.item_at_y(self.canvas.canvasy(0))
+            self.clear_drawing()
+            self.layout()
+            for y, label, _ in self.headers:
+                self.canvas.create_text(8, y + self.HEADER_HEIGHT - 8, text=label, anchor="sw",
+                                        font=("TkDefaultFont", 12, "bold"), fill="#234")
+                self.canvas.create_line(4, y + self.HEADER_HEIGHT - 4, self.columns * self.cell,
+                                        y + self.HEADER_HEIGHT - 4, fill="#bcd")
+            if anchor is not None:
+                self.show_item(anchor)
+        top, bottom = self.canvas.canvasy(0), self.canvas.canvasy(self.canvas.winfo_height())
+        first = max(0, bisect.bisect_right(self.row_tops, top) - 1 - self.MARGIN_ROWS)
+        last = min(len(self.rows), bisect.bisect_right(self.row_tops, bottom) + self.MARGIN_ROWS)
+        for r in [r for r in self.drawn if not first <= r < last]:
+            for item_id in self.drawn.pop(r):
+                self.canvas.delete(item_id)
+            for i in range(self.rows[r][1], self.rows[r][2]):
+                self.cell_items.pop(i, None)
+                self.photos.pop(i, None)
+        visible = []
+        for r in range(first, last):
+            y, start, end = self.rows[r]
+            if r not in self.drawn:
+                ids = []
+                for i in range(start, end):
+                    cx = 5 + (i - start) * self.cell + self.cell // 2
+                    cy = y + self.cell // 2
+                    ids.append(self.canvas.create_rectangle(cx - 60, cy - 60, cx + 60, cy + 60,
+                                                            outline="#ddd", fill="#f3f3f3"))
+                    img = self.canvas.create_image(cx, cy)
+                    ids.append(img)
+                    self.cell_items[i] = img
+                self.drawn[r] = ids
+            visible += [i for i in range(start, end) if i not in self.photos]
+        with self.wanted_lock:
+            # Nearest the view are fetched first (popped from the end).
+            self.wanted = [i for i in self.wanted if i in self.cell_items and i not in visible]
+            mid = (top + bottom) / 2
+            visible.sort(key=lambda i: -abs(self.item_y(i) - mid))
+            self.wanted += visible
+            self.wanted_lock.notify()
+
+    def row_of(self, i):
+        return bisect.bisect_right(self.row_firsts, i) - 1
+
+    def item_y(self, i):
+        return self.rows[self.row_of(i)][0] + self.cell / 2
+
+    def total_height(self):
+        return float(self.canvas.cget("scrollregion").split()[3])
+
+    def item_at_y(self, y):
+        if not self.rows:
+            return None
+        r = max(0, bisect.bisect_right(self.row_tops, y) - 1)
+        return self.rows[r][1]
+
+    def show_item(self, i):
+        y = self.rows[self.row_of(i)][0]
+        self.canvas.yview_moveto(max(0, y - self.HEADER_HEIGHT) / self.total_height())
+
+    def thumbnail_worker(self):
+        while True:
+            with self.wanted_lock:
+                while not self.wanted and not self.closed:
+                    self.wanted_lock.wait()
+                if self.closed:
+                    return
+                i = self.wanted.pop()
+                generation = self.generation
+                try:
+                    path = self.items[i]["path"]
+                except IndexError:
+                    continue
+            try:
+                img = self.sorter.load_thumbnail(path)
+            except Exception as e:
+                print(f"⚠️ Timeline could not load {path}: {e}")
+                continue
+            try:
+                self.after(0, self.place_thumbnail, generation, i, img)
+            except Exception:
+                return  # window closed
+
+    def place_thumbnail(self, generation, i, img):
+        if generation != self.generation or i not in self.cell_items:
+            return
+        photo = ImageTk.PhotoImage(img)
+        self.photos[i] = photo
+        self.canvas.itemconfig(self.cell_items[i], image=photo)
+
+    # --- interaction ----------------------------------------------------------
+
+    def item_at(self, event):
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        r = bisect.bisect_right(self.row_tops, y) - 1
+        if r < 0 or y >= self.rows[r][0] + self.cell:
+            return None
+        i = self.rows[r][1] + int((x - 5) // self.cell)
+        return i if x >= 5 and i < self.rows[r][2] else None
+
+    def show_path(self, event):
+        i = self.item_at(event)
+        if i is not None:
+            d = self.items[i]
+            self.status.config(text=f"{d['date'] or 'No date'}   {d['path']}")
+
+    def open_viewer(self, event):
+        i = self.item_at(event)
+        if i is not None:
+            ImageViewer(self, self.items[i]["path"])
+
+    def show_menu(self, event):
+        i = self.item_at(event)
+        if i is None:
+            return
+        path = self.items[i]["path"]
+        self.menu.delete(0, tk.END)
+        self.menu.add_command(label="View", command=lambda: ImageViewer(self, path))
+        self.menu.add_command(label="Open Folder in Sorter",
+                              command=lambda: self.open_in_sorter(os.path.dirname(path)))
+        self.menu.tk_popup(event.x_root, event.y_root)
+
+    def open_in_sorter(self, folder):
+        self.sorter.folder_entry.delete(0, tk.END)
+        self.sorter.folder_entry.insert(0, folder)
+        self.sorter.load_from_entry()
+        self.sorter.lift()
+
+    def jump_to_year(self, event):
+        sel = self.year_list.curselection()
+        if not sel or not self.year_tops:
+            return
+        self.canvas.yview_moveto(self.year_tops[sel[0]][1] / self.total_height())
+
+    def wheel_step(self, event):
+        return self.sorter.wheel_step(event)
+
+    def scroll(self, units):
+        self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def page(self, direction):
+        self.canvas.yview_scroll(direction, "pages")
+        return "break"
+
+    def moveto(self, event, fraction):
+        if not isinstance(event.widget, tk.Entry):
+            self.canvas.yview_moveto(fraction)
+        return "break"
+
+    def close(self):
+        self.generation += 1  # stops a scan in progress
+        with self.wanted_lock:
+            self.closed = True
+            self.wanted.clear()
+            self.wanted_lock.notify()
+        self.destroy()
+
+
 class DragDropSorter(tk.Tk):
 
     def load_config(self):
@@ -724,6 +1110,7 @@ class DragDropSorter(tk.Tk):
         self.tooltip = None
         self.tooltip_after = None
         self.keywords_window = None
+        self.timeline_window = None
         self.grid_directory = None  # folder whose thumbnails are in the grid
         self.selected_widgets = []
         self.last_clicked_label = None
@@ -744,6 +1131,7 @@ class DragDropSorter(tk.Tk):
     def create_ui(self):
         menubar = tk.Menu(self)
         menubar.add_command(label="EXIF", command=self.open_keywords_window)
+        menubar.add_command(label="Timeline", command=self.open_timeline)
         self.config(menu=menubar)
 
         # Folder tree on the left, everything else on the right; the sash can be dragged.
@@ -1614,6 +2002,16 @@ class DragDropSorter(tk.Tk):
             self.keywords_window.lift()
             return
         self.keywords_window = KeywordsWindow(self)
+
+    def open_timeline(self):
+        if self.timeline_window and self.timeline_window.winfo_exists():
+            self.timeline_window.deiconify()
+            self.timeline_window.lift()
+            return
+        # Start where Move & Rename would: its last destination.
+        folder = self.move_destination if self.move_destination and os.path.isdir(self.move_destination) \
+            else (self.folder_entry.get().strip() or self.image_directory)
+        self.timeline_window = TimelineWindow(self, folder)
 
     def keyword_targets(self):
         """Photos the EXIF window acts on: the selection (in grid order), else all.

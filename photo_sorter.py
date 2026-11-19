@@ -377,11 +377,18 @@ class DatePickerDialog(tk.Toplevel):
 
 
 class ImageViewer(tk.Toplevel):
-    def __init__(self, master, image_path):
+    """Full-size view of one photo. Given the list of photos it was opened from,
+    the Left and Right arrow keys step to the previous and next one."""
+
+    def __init__(self, master, image_path, paths=None):
         super().__init__(master)
-        self.title(os.path.basename(image_path))
         self.geometry("800x600")
-        self._image = ImageOps.exif_transpose(Image.open(image_path))
+        self._paths = list(paths) if paths else [image_path]
+        self._index = self._paths.index(image_path) if image_path in self._paths else 0
+        if image_path not in self._paths:
+            self._paths.insert(0, image_path)
+        self._image = None
+        self._load()
         self._scale = 1.0
         self._offset = [0.0, 0.0]
         self._drag_start = None
@@ -405,8 +412,42 @@ class ImageViewer(tk.Toplevel):
         self._canvas.bind("<B1-Motion>", self._on_pan_move)
         # Redraw on resize so newly exposed areas get filled; skipped until the first fit.
         self._canvas.bind("<Configure>", lambda e: self._photo and self._redraw())
+        self.bind("<Left>", lambda e: self.step(-1))
+        self.bind("<Right>", lambda e: self.step(1))
+        self.bind("<Escape>", lambda e: self.destroy())
+        # The sorter binds these application-wide to act on its grid's selection;
+        # stop them reaching it from here.
+        for key in ("<Delete>", "<KeyPress-r>", "<KeyPress-R>", "<Control-x>", "<Control-X>",
+                    "<Control-v>", "<Control-V>", "<Home>", "<End>", "<Prior>", "<Next>"):
+            self.bind(key, lambda e: "break")
+        self.focus_set()
 
         self.after(100, self._fit_to_window)
+
+    def _load(self):
+        path = self._paths[self._index]
+        position = f"   ({self._index + 1} of {len(self._paths)})" if len(self._paths) > 1 else ""
+        try:
+            image = ImageOps.exif_transpose(Image.open(path))
+        except Exception as e:
+            print(f"⚠️ Could not open {path}: {e}")
+            image = Image.new("RGB", (400, 300), "black")
+            position += "   — could not open"
+        if self._image is not None:
+            self._image.close()
+        self._image = image
+        self.title(os.path.basename(path) + position)
+
+    def step(self, delta):
+        index = self._index + delta
+        if not 0 <= index < len(self._paths):
+            self.bell()
+            return "break"
+        self._index = index
+        self._load()
+        if self._photo:  # once the window has had its first fit
+            self._fit_to_window()
+        return "break"
 
     def _fit_to_window(self):
         cw = self._canvas.winfo_width()
@@ -455,9 +496,11 @@ class ImageViewer(tk.Toplevel):
 
     def _on_mousewheel(self, event):
         self._zoom_at(1.1 if event.delta > 0 else 1 / 1.1, event.x, event.y)
+        return "break"  # don't also scroll the sorter's grid
 
     def _on_scroll_linux(self, event):
         self._zoom_at(1.1 if event.num == 4 else 1 / 1.1, event.x, event.y)
+        return "break"
 
     def zoom_in(self):
         self._zoom_at(1.25, self._canvas.winfo_width() / 2, self._canvas.winfo_height() / 2)
@@ -986,7 +1029,7 @@ class TimelineWindow(tk.Toplevel):
     def open_viewer(self, event):
         i = self.item_at(event)
         if i is not None:
-            ImageViewer(self, self.items[i]["path"])
+            self.view(i)
 
     def show_menu(self, event):
         i = self.item_at(event)
@@ -994,10 +1037,13 @@ class TimelineWindow(tk.Toplevel):
             return
         path = self.items[i]["path"]
         self.menu.delete(0, tk.END)
-        self.menu.add_command(label="View", command=lambda: ImageViewer(self, path))
+        self.menu.add_command(label="View", command=lambda: self.view(i))
         self.menu.add_command(label="Open Folder in Sorter",
                               command=lambda: self.open_in_sorter(os.path.dirname(path)))
         self.menu.tk_popup(event.x_root, event.y_root)
+
+    def view(self, i):
+        ImageViewer(self, self.items[i]["path"], [d["path"] for d in self.items])
 
     def open_in_sorter(self, folder):
         self.sorter.folder_entry.delete(0, tk.END)
@@ -2023,7 +2069,8 @@ class DragDropSorter(tk.Tk):
         # Look up the filename now rather than at load time: renames change it.
         data = next((d for d in self.image_data if d["label"] is label), None)
         if data:
-            ImageViewer(self, os.path.join(self.image_directory, data["filename"]))
+            paths = [os.path.join(self.image_directory, d["filename"]) for d in self.image_data]
+            ImageViewer(self, os.path.join(self.image_directory, data["filename"]), paths)
 
     def delete_selected_thumbnails(self, event=None):
         if not self.selected_widgets:

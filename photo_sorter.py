@@ -3,7 +3,7 @@ from tkinter import messagebox
 from tkinter import filedialog
 from tkinter import simpledialog
 from tkinter import ttk
-from PIL import Image, ImageTk, ImageOps, IptcImagePlugin, PngImagePlugin
+from PIL import Image, ImageTk, ImageOps, ImageStat, IptcImagePlugin, PngImagePlugin
 import os, json, threading, bisect, datetime, calendar, re, shutil, math, stat, subprocess, time
 import xml.etree.ElementTree as ET
 import piexif
@@ -376,6 +376,93 @@ class DatePickerDialog(tk.Toplevel):
         self.destroy()
 
 
+def stretch_channel(hist, clip):
+    """A lookup table stretching one channel so the darkest and brightest clip
+    fraction of its pixels become 0 and 255. Left alone if there's no range."""
+    cut = sum(hist) * clip
+    lo, acc = 0, 0
+    while lo < 255 and acc + hist[lo] <= cut:
+        acc += hist[lo]
+        lo += 1
+    hi, acc = 255, 0
+    while hi > 0 and acc + hist[hi] <= cut:
+        acc += hist[hi]
+        hi -= 1
+    if hi - lo < 10:
+        return list(range(256))
+    return [min(255, max(0, round((v - lo) * 255 / (hi - lo)))) for v in range(256)]
+
+
+def neutral_midtones(rgb, strength):
+    """Per-channel gamma that moves the midtones' average colour toward grey.
+    strength 1 makes it fully grey; less keeps some of a scene's own warmth
+    (lamplight, candles), which full strength would turn blue."""
+    mask = rgb.convert("L").point(lambda v: 255 if 60 <= v <= 200 else 0)
+    if not mask.getbbox():
+        return rgb
+    means = ImageStat.Stat(rgb, mask=mask).mean
+    target = sum(means) / 3
+    lut = []
+    for m in means:
+        gamma = math.log(target / 255) / math.log(min(max(m, 1), 254) / 255)
+        gamma = min(1.8, max(0.55, gamma)) ** strength
+        lut += [round(255 * (v / 255) ** gamma) for v in range(256)]
+    return rgb.point(lut)
+
+
+def auto_color_balance(img, clip=0.005, strength=0.5):
+    """Correct a faded print's colour cast: stretch red, green and blue separately
+    to the full range, then pull the midtones partway toward neutral. Each pass
+    is moderate; running it again on the result corrects further."""
+    if img.mode == "L":
+        return img.point(stretch_channel(img.histogram(), clip))
+    alpha = img.getchannel("A") if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info else None
+    rgb = img.convert("RGB")
+    hist = rgb.histogram()
+    lut = []
+    for c in range(3):
+        lut += stretch_channel(hist[c * 256:(c + 1) * 256], clip)
+    fixed = neutral_midtones(rgb.point(lut), strength)
+    if alpha is not None:
+        fixed.putalpha(alpha.convert("L") if alpha.mode != "L" else alpha)
+    return fixed
+
+
+def save_color_balanced(path, passes=1):
+    """Write the auto colour balanced version of a photo over it, keeping all of
+    its metadata. The original goes into the folder's .trash. Returns the name
+    it was given there."""
+    directory, name = os.path.split(path)
+    tmp = os.path.join(directory, f".colorfix_{os.getpid()}_{name}")
+    try:
+        with Image.open(path) as raw:
+            # Corrected as stored, not as displayed, so the EXIF Orientation copied
+            # across below still turns it upright.
+            fixed = raw
+            for _ in range(passes):
+                fixed = auto_color_balance(fixed)
+            kwargs = {}
+            if raw.info.get("icc_profile"):
+                kwargs["icc_profile"] = raw.info["icc_profile"]
+            if raw.format == "JPEG":
+                from PIL import JpegImagePlugin
+                sampling = JpegImagePlugin.get_sampling(raw)
+                kwargs.update(quality=95, **({"subsampling": sampling} if sampling >= 0 else {}))
+            fixed.save(tmp, format=raw.format, **kwargs)
+        result = subprocess.run(["exiftool", "-q", "-q", "-overwrite_original", "-tagsFromFile", path,
+                                 "-all:all", "-ThumbnailImage=", tmp], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not copy metadata: {result.stderr.strip() or result.returncode}")
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        trashed = move_to_trash(directory, name)
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+        return trashed
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 class ImageViewer(tk.Toplevel):
     """Full-size view of one photo. Given the list of photos it was opened from,
     the Left and Right arrow keys step to the previous and next one."""
@@ -388,12 +475,25 @@ class ImageViewer(tk.Toplevel):
         if image_path not in self._paths:
             self._paths.insert(0, image_path)
         self._image = None
+        self._original = None  # the photo as on disk, while a correction is shown
+        self._passes = 0       # times Auto Color Balance has been applied to it
         self._load()
         self._scale = 1.0
         self._offset = [0.0, 0.0]
         self._drag_start = None
         self._photo = None
         self._zoom_var = tk.StringVar(value="100%")
+
+        menubar = tk.Menu(self)
+        self._color_menu = tk.Menu(menubar, tearoff=0)
+        self._color_menu.add_command(label="Auto Color Balance", accelerator="Ctrl+B",
+                                     command=self.color_balance)
+        self._color_menu.add_command(label="Show Original", command=self.show_original)
+        self._color_menu.add_separator()
+        self._color_menu.add_command(label="Save Color Balance...", command=self.save_color_balance)
+        menubar.add_cascade(label="Color", menu=self._color_menu)
+        self.config(menu=menubar)
+        self._update_menu()
 
         toolbar = tk.Frame(self)
         tk.Button(toolbar, text="−", width=2, command=self.zoom_out).pack(side="left", padx=2)
@@ -415,6 +515,8 @@ class ImageViewer(tk.Toplevel):
         self.bind("<Left>", lambda e: self.step(-1))
         self.bind("<Right>", lambda e: self.step(1))
         self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Control-b>", lambda e: self.color_balance())
+        self.bind("<Control-B>", lambda e: self.color_balance())
         # The sorter binds these application-wide to act on its grid's selection;
         # stop them reaching it from here.
         for key in ("<Delete>", "<KeyPress-r>", "<KeyPress-R>", "<Control-x>", "<Control-X>",
@@ -435,8 +537,77 @@ class ImageViewer(tk.Toplevel):
             position += "   — could not open"
         if self._image is not None:
             self._image.close()
-        self._image = image
-        self.title(os.path.basename(path) + position)
+        if self._original is not None:
+            self._original.close()
+        self._image, self._original, self._passes = image, None, 0
+        self._failed = "could not open" in position
+        self._update_title()
+        if hasattr(self, "_color_menu"):
+            self._update_menu()
+
+    def _update_title(self):
+        path = self._paths[self._index]
+        title = os.path.basename(path)
+        if len(self._paths) > 1:
+            title += f"   ({self._index + 1} of {len(self._paths)})"
+        if self._failed:
+            title += "   — could not open"
+        elif self._passes:
+            title += "   — color balanced" + (f" ×{self._passes}" if self._passes > 1 else "") + ", not saved"
+        self.title(title)
+
+    def _update_menu(self):
+        corrected = self._passes > 0
+        self._color_menu.entryconfig(0, label="Auto Color Balance" + (" Again" if corrected else ""))
+        for label, enabled in ((0, not self._failed),
+                               ("Show Original", corrected),
+                               ("Save Color Balance...", corrected)):
+            self._color_menu.entryconfig(label, state="normal" if enabled else "disabled")
+
+    def color_balance(self):
+        if self._failed:
+            return "break"
+        balanced = auto_color_balance(self._image)
+        if self._original is None:
+            self._original = self._image
+        else:
+            self._image.close()  # an earlier pass's result
+        self._image = balanced
+        self._passes += 1
+        self._update_title()
+        self._update_menu()
+        self._redraw()
+        return "break"
+
+    def show_original(self):
+        if self._original is None:
+            return
+        self._image.close()
+        self._image, self._original, self._passes = self._original, None, 0
+        self._update_title()
+        self._update_menu()
+        self._redraw()
+
+    def save_color_balance(self):
+        if self._failed or not self._passes:
+            return
+        path = self._paths[self._index]
+        if not messagebox.askyesno(
+                "Save Color Balance",
+                f"Replace {os.path.basename(path)} with the color-balanced version?\n\n"
+                f"The original will be kept in this folder's {TRASH_DIR}.", parent=self):
+            return
+        try:
+            trashed = save_color_balanced(path, self._passes)
+        except Exception as e:
+            messagebox.showerror("Save Color Balance", f"Could not save:\n{e}", parent=self)
+            return
+        print(f"🎨 Color balanced {path} (original in {TRASH_DIR}/{trashed})")
+        self._load()
+        self._redraw()
+        changed = getattr(self.master, "photo_changed", None)
+        if changed:
+            changed(path)
 
     def step(self, delta):
         index = self._index + delta
@@ -1045,6 +1216,18 @@ class TimelineWindow(tk.Toplevel):
     def view(self, i):
         ImageViewer(self, self.items[i]["path"], [d["path"] for d in self.items])
 
+    def photo_changed(self, path):
+        """Redraw a photo's thumbnail after the viewer changes it."""
+        for i, d in enumerate(self.items):
+            if d["path"] == path and i in self.cell_items:
+                self.photos.pop(i, None)
+                with self.wanted_lock:
+                    self.wanted.append(i)
+                    self.wanted_lock.notify()
+        changed = getattr(self.sorter, "photo_changed", None)
+        if changed:
+            changed(path)
+
     def open_in_sorter(self, folder):
         self.sorter.folder_entry.delete(0, tk.END)
         self.sorter.folder_entry.insert(0, folder)
@@ -1165,6 +1348,9 @@ class DragDropSorter(tk.Tk):
         self._folder_drag = None
         self.cut_files = None  # (folder, filenames) waiting for Ctrl-V
         self.saved_view = {}  # scroll positions read for the folder being loaded
+        self._tree_click = False  # the folder being opened was clicked in the tree
+        self.color_undo = []  # [(path, original's name in .trash, key of the balanced file)]
+        self.color_busy = False
 
         self.load_config()
         self.hide_hidden_files_in_dialogs()
@@ -1517,6 +1703,16 @@ class DragDropSorter(tk.Tk):
                 self.fill_tree_node(path)
         self.reveal_in_tree()
 
+    def restore_tree_view(self, top):
+        """Scroll the tree to top (a yview fraction), then make sure the folder on
+        screen is in view: rows opened or closed since a position was saved can
+        leave it pointing somewhere else."""
+        if top is not None:
+            self.tree.yview_moveto(top)
+        selected = self.tree.selection()
+        if selected and not self.tree.bbox(selected[0]):
+            self.tree.see(selected[0])
+
     def reveal_in_tree(self):
         """Open the rows down to the folder on screen and select it."""
         root, current = self.tree_root(), os.path.normpath(self.image_directory or "")
@@ -1631,10 +1827,15 @@ class DragDropSorter(tk.Tk):
         # and any thumbnails it already queued via after() are discarded.
         self.load_generation += 1
         self.grid_directory = self.image_directory
+        # A folder clicked in the tree keeps the tree where it is; otherwise go back
+        # to where the tree was when this folder was last open.
+        tree_top = self.tree.yview()[0] if self._tree_click else None
+        self._tree_click = False
         self.refresh_tree()
         self.saved_view = self.read_view_state(self.image_directory)
-        if "tree" in self.saved_view:
-            self.after_idle(self.tree.yview_moveto, self.saved_view["tree"])
+        if tree_top is None:
+            tree_top = self.saved_view.get("tree")
+        self.after_idle(self.restore_tree_view, tree_top)
         threading.Thread(target=self.load_thumbnails_thread, daemon=True,
                          args=(self.load_generation, self.image_directory, self.image_files)).start()
 
@@ -1704,6 +1905,13 @@ class DragDropSorter(tk.Tk):
         if self.selected_widgets:
             self.grid_menu.add_command(label=f"Cut {len(self.selected_widgets)} Photo(s)", accelerator="Ctrl+X",
                                        command=self.cut_selection)
+            self.grid_menu.add_command(label=f"Color Balance {len(self.selected_widgets)} Photo(s)",
+                                       command=self.color_balance_selection,
+                                       state="disabled" if self.color_busy else "normal")
+        if self.color_undo:
+            self.grid_menu.add_command(label=f"Undo Color Balance ({len(self.color_undo)} Photo(s))",
+                                       command=self.undo_color_balance,
+                                       state="disabled" if self.color_busy else "normal")
         if self.cut_files:
             count = len(self.cut_files[1])
             if folder:
@@ -2059,6 +2267,82 @@ class DragDropSorter(tk.Tk):
             else (self.folder_entry.get().strip() or self.image_directory)
         self.timeline_window = TimelineWindow(self, folder)
 
+    def photo_changed(self, path):
+        """Redraw a photo's thumbnail after the viewer changes it."""
+        data = next((d for d in self.image_data
+                     if os.path.join(self.image_directory, d["filename"]) == path), None)
+        if data is None:
+            return
+        try:
+            img = self.load_thumbnail(path)
+        except Exception as e:
+            print(f"⚠️ Could not reload thumbnail for {path}: {e}")
+            return
+        photo = ImageTk.PhotoImage(img)
+        data["label"].config(image=photo)
+        data["label"].image = photo
+        data["photo"] = photo
+
+    def color_balance_selection(self):
+        """Auto colour balance the selected photos in place, one pass each, the
+        originals going to .trash. Runs in the background; Undo puts them back."""
+        if self.color_busy:
+            return
+        paths = [os.path.join(self.image_directory, d["filename"])
+                 for d in self.image_data if d["label"] in self.selected_widgets]
+        if not paths:
+            return
+        self.color_busy = True
+        threading.Thread(target=self.color_balance_thread, args=(paths,), daemon=True).start()
+
+    def color_balance_thread(self, paths):
+        done, failed = [], 0
+        for n, path in enumerate(paths, 1):
+            try:
+                trashed = save_color_balanced(path)
+                done.append((path, trashed, source_key(path)))
+                print(f"🎨 Color balanced {path} (original in {TRASH_DIR}/{trashed})")
+                self.after(0, self.photo_changed, path)
+            except Exception as e:
+                failed += 1
+                print(f"⚠️ Could not color balance {path}: {e}")
+            self.after(0, lambda n=n: self.loading_label.config(
+                text=f"Color balancing {n} of {len(paths)}..."))
+        self.after(0, self.color_balance_done, done, failed)
+
+    def color_balance_done(self, done, failed):
+        self.color_busy = False
+        self.color_undo = done
+        text = f"🎨 Color balanced {len(done)} photo(s)."
+        if failed:
+            text += f" {failed} failed (see terminal)."
+        if done:
+            text += " Right-click → Undo Color Balance to restore."
+        self.loading_label.config(text=text)
+
+    def undo_color_balance(self):
+        """Put back the originals from the last color balance. A photo is skipped if
+        it has changed since (renamed, moved, edited), so nothing else is overwritten."""
+        if self.color_busy:
+            return
+        restored, skipped = 0, []
+        for path, trashed, key in self.color_undo:
+            original = os.path.join(os.path.dirname(path), TRASH_DIR, trashed)
+            try:
+                if not os.path.exists(original) or source_key(path) != key:
+                    raise FileNotFoundError
+                os.replace(original, path)
+            except OSError:
+                skipped.append(os.path.basename(path))
+                continue
+            restored += 1
+            self.photo_changed(path)
+        self.color_undo = []
+        text = f"↩️ Restored {restored} original(s)."
+        if skipped:
+            text += f" Skipped {len(skipped)} changed since: {', '.join(skipped[:5])}" + ("..." if len(skipped) > 5 else "")
+        self.loading_label.config(text=text)
+
     def keyword_targets(self):
         """Photos the EXIF window acts on: the selection (in grid order), else all.
         Returns (photos, whether they're a selection)."""
@@ -2278,7 +2562,9 @@ class DragDropSorter(tk.Tk):
         else:
             released_on_it = self.tree_folder_at(event.x_root, event.y_root) == drag["path"]
         if released_on_it and drag["path"] != os.path.normpath(self.image_directory):
+            self._tree_click = not drag["label"]
             self.navigate_to_folder(drag["path"])
+            self._tree_click = False  # in case the folder wasn't opened
 
     def move_folder(self, src, dest_dir):
         """Move a folder into another one. Logged like photo moves in the folder it

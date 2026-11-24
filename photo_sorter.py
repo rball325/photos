@@ -2143,7 +2143,12 @@ class DragDropSorter(tk.Tk):
         self.grid_row_offset = self.folder_rows()
         self.add_folder_widgets()
         self.redraw_grid()
+        # Rebuilding the tree scrolls it (to the top, then to the folder on screen);
+        # put it back where it was, both now and once the rows are laid out.
+        tree_top = self.tree.yview()[0]
         self.refresh_tree()
+        self.tree.yview_moveto(tree_top)
+        self.after_idle(self.tree.yview_moveto, tree_top)
 
     def show_grid_menu(self, event):
         if not self.grid_directory:

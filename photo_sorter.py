@@ -463,13 +463,231 @@ def save_color_balanced(path, passes=1):
             os.remove(tmp)
 
 
+# --- Undo/redo history -------------------------------------------------------
+#
+# Every command that changes files records the steps it took. Undo runs them
+# backwards, Redo forwards again. Steps record how to reverse themselves (a move
+# moves back, a rotation turns back, old EXIF dates are written back) rather
+# than keeping copies of photos, so undo costs no disk space. The history lasts
+# for this run of the program.
+
+UNDO_STORE_ROOT = os.path.join(os.path.expanduser("~"), ".cache", "photo_sorter", "undo")
+EXIF_DATE_TAGS = (("0th", piexif.ImageIFD.DateTime),
+                  ("Exif", piexif.ExifIFD.DateTimeOriginal),
+                  ("Exif", piexif.ExifIFD.DateTimeDigitized))
+
+
+def read_jpeg_dates(path):
+    exif = load_exif(path)
+    return [exif.get(ifd, {}).get(tag) for ifd, tag in EXIF_DATE_TAGS]
+
+
+def write_jpeg_dates(path, values):
+    exif = load_exif(path)
+    for (ifd, tag), value in zip(EXIF_DATE_TAGS, values):
+        if value is None:
+            exif.get(ifd, {}).pop(tag, None)
+        else:
+            exif.setdefault(ifd, {})[tag] = value
+    write_exif(path, exif)
+
+
+class UndoError(Exception):
+    """A step that can't be undone or redone because things have changed since."""
+
+
+class MoveStep:
+    """A file or folder moved or renamed from src to dst."""
+    def __init__(self, src, dst):
+        self.src, self.dst = os.path.normpath(src), os.path.normpath(dst)
+
+    @staticmethod
+    def _move(a, b):
+        if not os.path.lexists(a):
+            raise UndoError(f"{a} is no longer there")
+        if os.path.lexists(b):
+            raise UndoError(f"{b} is in the way")
+        os.makedirs(os.path.dirname(b), exist_ok=True)
+        is_file = os.path.isfile(a)
+        shutil.move(a, b)
+        if is_file:
+            move_cached_thumb(a, b)
+        # Don't leave behind a .trash that undo just emptied.
+        left = os.path.dirname(a)
+        if os.path.basename(left) == TRASH_DIR:
+            shutil.rmtree(os.path.join(left, THUMB_DIR), ignore_errors=True)
+            try:
+                os.rmdir(left)
+            except OSError:
+                pass  # still holds other things
+        return [a, b]
+
+    def undo(self, store):
+        return self._move(self.dst, self.src)
+
+    def redo(self, store):
+        return self._move(self.src, self.dst)
+
+
+class CreateStep:
+    """A file the command created (a log, a colour balanced photo). Undo puts it
+    aside in the undo store; Redo brings it back."""
+    def __init__(self, path):
+        self.path = os.path.normpath(path)
+        self.stash = None
+
+    def undo(self, store):
+        if not os.path.exists(self.path):
+            raise UndoError(f"{self.path} is no longer there")
+        os.makedirs(store, exist_ok=True)
+        self.stash = os.path.join(store, f"{id(self)}_{os.path.basename(self.path)}")
+        shutil.move(self.path, self.stash)
+        return [self.path]
+
+    def redo(self, store):
+        if not self.stash or not os.path.exists(self.stash):
+            raise UndoError(f"the undone copy of {self.path} is gone")
+        if os.path.lexists(self.path):
+            raise UndoError(f"{self.path} is in the way")
+        shutil.move(self.stash, self.path)
+        self.stash = None
+        return [self.path]
+
+
+class MkdirStep:
+    def __init__(self, path):
+        self.path = os.path.normpath(path)
+
+    def undo(self, store):
+        # The program's own clutter (thumbnail cache, scroll position) doesn't count.
+        for junk in (THUMB_DIR, VIEW_FILE):
+            junk = os.path.join(self.path, junk)
+            if os.path.isdir(junk):
+                shutil.rmtree(junk, ignore_errors=True)
+            elif os.path.exists(junk):
+                os.remove(junk)
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            raise UndoError(f"folder {self.path} isn't empty")
+        return [self.path]
+
+    def redo(self, store):
+        os.makedirs(self.path)
+        return [self.path]
+
+
+class RotateStep:
+    def __init__(self, path, clockwise):
+        self.path, self.clockwise = path, clockwise
+
+    def undo(self, store):
+        rotate_jpeg(self.path, not self.clockwise)
+        return [self.path]
+
+    def redo(self, store):
+        rotate_jpeg(self.path, self.clockwise)
+        return [self.path]
+
+
+class ExifDateStep:
+    def __init__(self, path, before, after):
+        self.path, self.before, self.after = path, before, after
+
+    def undo(self, store):
+        write_jpeg_dates(self.path, self.before)
+        return [self.path]
+
+    def redo(self, store):
+        write_jpeg_dates(self.path, self.after)
+        return [self.path]
+
+
+class KeywordsStep:
+    """Keywords actually added to and removed from some photos (not ones that
+    were already there, or already absent, so undo leaves those alone)."""
+    def __init__(self, paths, added, removed):
+        self.paths, self.added, self.removed = list(paths), list(added), list(removed)
+
+    def undo(self, store):
+        edit_keywords(self.paths, add=self.removed, remove=self.added)
+        return self.paths
+
+    def redo(self, store):
+        edit_keywords(self.paths, add=self.added, remove=self.removed)
+        return self.paths
+
+
+class History:
+    LIMIT = 200  # oldest commands drop off beyond this
+
+    def __init__(self):
+        self.undo_stack, self.redo_stack = [], []
+        self.store = os.path.join(UNDO_STORE_ROOT, f"{os.getpid()}")
+        # Clear out what earlier runs left behind if they didn't exit cleanly.
+        try:
+            for name in os.listdir(UNDO_STORE_ROOT):
+                if name.isdigit() and not os.path.exists(f"/proc/{name}"):
+                    shutil.rmtree(os.path.join(UNDO_STORE_ROOT, name), ignore_errors=True)
+        except OSError:
+            pass
+
+    def record(self, label, steps):
+        """Add a finished command. Steps are in the order they were done."""
+        if not steps:
+            return
+        self.undo_stack.append((label, list(steps)))
+        del self.undo_stack[:-self.LIMIT]
+        self.redo_stack.clear()
+        shutil.rmtree(self.store, ignore_errors=True)  # only undone creations lived there
+
+    def undo_label(self):
+        return self.undo_stack[-1][0] if self.undo_stack else None
+
+    def redo_label(self):
+        return self.redo_stack[-1][0] if self.redo_stack else None
+
+    def _run(self, source, target, undo):
+        """Undo (or redo) the latest command. Returns (label, steps, paths touched,
+        problems). A step that fails is reported and the rest still run."""
+        label, steps = source.pop()
+        touched, problems = [], []
+        for step in (reversed(steps) if undo else steps):
+            try:
+                touched += step.undo(self.store) if undo else step.redo(self.store)
+            except Exception as e:
+                problems.append(str(e))
+        target.append((label, steps))
+        return label, steps, touched, problems
+
+    def undo(self):
+        return self._run(self.undo_stack, self.redo_stack, undo=True)
+
+    def redo(self):
+        return self._run(self.redo_stack, self.undo_stack, undo=False)
+
+    def close(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+
+
+def color_balance_steps(path, trashed):
+    """History steps for save_color_balanced: the original went to .trash and a
+    new file took its place."""
+    directory = os.path.dirname(path)
+    return [MoveStep(path, os.path.join(directory, TRASH_DIR, trashed)), CreateStep(path)]
+
+
 class ImageViewer(tk.Toplevel):
     """Full-size view of one photo. Given the list of photos it was opened from,
     the Left and Right arrow keys step to the previous and next one."""
 
+    open_viewers = set()
+
     def __init__(self, master, image_path, paths=None):
         super().__init__(master)
         self.geometry("800x600")
+        ImageViewer.open_viewers.add(self)
+        self.bind("<Destroy>", lambda e: e.widget is self and ImageViewer.open_viewers.discard(self))
         self._paths = list(paths) if paths else [image_path]
         self._index = self._paths.index(image_path) if image_path in self._paths else 0
         if image_path not in self._paths:
@@ -603,11 +821,20 @@ class ImageViewer(tk.Toplevel):
             messagebox.showerror("Save Color Balance", f"Could not save:\n{e}", parent=self)
             return
         print(f"🎨 Color balanced {path} (original in {TRASH_DIR}/{trashed})")
+        sorter = getattr(self.master, "sorter", self.master)
+        sorter.history.record(f"Color Balance {os.path.basename(path)}", color_balance_steps(path, trashed))
         self._load()
         self._redraw()
         changed = getattr(self.master, "photo_changed", None)
         if changed:
             changed(path)
+
+    def file_changed(self, path):
+        """Show the photo again if something (Undo, Redo) changed it on disk."""
+        if os.path.normpath(self._paths[self._index]) == os.path.normpath(path):
+            self._load()
+            if self._photo:
+                self._redraw()
 
     def step(self, delta):
         index = self._index + delta
@@ -846,6 +1073,13 @@ class KeywordsWindow(tk.Toplevel):
             self.status_label.config(text="Keywords can only be written to JPEGs.")
             return
         self.config(cursor="watch"); self.update_idletasks()
+        # What each photo had, so undo reverses only what this actually changed.
+        had = {}
+        for p in jpegs:
+            try:
+                had[p] = {k.lower() for k in read_photo_metadata(p)[1]}
+            except Exception:
+                had[p] = set()
         try:
             summary = edit_keywords(jpegs, add=keywords if add else (), remove=() if add else keywords)
         except FileNotFoundError:
@@ -856,6 +1090,14 @@ class KeywordsWindow(tk.Toplevel):
             return
         finally:
             self.config(cursor="")
+        groups = {}
+        for p in jpegs:
+            added = tuple(k for k in (keywords if add else ()) if k.lower() not in had[p])
+            removed = tuple(k for k in (() if add else keywords) if k.lower() in had[p])
+            if added or removed:
+                groups.setdefault((added, removed), []).append(p)
+        self.sorter.history.record(f"{'Add' if add else 'Remove'} Keyword(s) {', '.join(keywords)}",
+                                   [KeywordsStep(ps, a, r) for (a, r), ps in groups.items()])
         skipped = len(names) - len(jpegs)
         self.status_label.config(
             text=f"{'Added' if add else 'Removed'} {', '.join(keywords)} {'to' if add else 'from'} {len(jpegs)} photo(s)."
@@ -1349,7 +1591,7 @@ class DragDropSorter(tk.Tk):
         self.cut_files = None  # (folder, filenames) waiting for Ctrl-V
         self.saved_view = {}  # scroll positions read for the folder being loaded
         self._tree_click = False  # the folder being opened was clicked in the tree
-        self.color_undo = []  # [(path, original's name in .trash, key of the balanced file)]
+        self.history = History()
         self.color_busy = False
 
         self.load_config()
@@ -1362,6 +1604,10 @@ class DragDropSorter(tk.Tk):
 
     def create_ui(self):
         menubar = tk.Menu(self)
+        self.edit_menu = tk.Menu(menubar, tearoff=0, postcommand=self.update_edit_menu)
+        self.edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
+        self.edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
+        menubar.add_cascade(label="Edit", menu=self.edit_menu)
         menubar.add_command(label="EXIF", command=self.open_keywords_window)
         menubar.add_command(label="Timeline", command=self.open_timeline)
         self.config(menu=menubar)
@@ -1400,7 +1646,6 @@ class DragDropSorter(tk.Tk):
         tk.Button(main, text="Preview Rename", command=self.preview_order).pack(pady=2)
         tk.Button(main, text="Rename & Save Order", command=self.save_order).pack(pady=2)
         tk.Button(main, text="Move & Rename To...", command=self.move_and_rename_to_folder).pack(pady=2)
-        tk.Button(main, text="Restore From Log", command=self.restore_from_log).pack(pady=2)
 
         self.loading_label = tk.Label(main, text="Click 'Load' to load thumbnails")
         self.loading_label.pack(pady=5)
@@ -1435,6 +1680,9 @@ class DragDropSorter(tk.Tk):
         self.bind_all("<Control-x>", self.cut_selection)
         self.bind_all("<Control-X>", self.cut_selection)
         self.bind_all("<Control-v>", self.paste_cut)
+        self.bind_all("<Control-z>", self.undo)
+        self.bind_all("<Control-Z>", self.redo)  # Ctrl+Shift+Z
+        self.bind_all("<Control-y>", self.redo)
         self.bind_all("<Control-V>", self.paste_cut)
         self.bind_all("<Home>", lambda e: self.scroll_grid_to(e, 0.0))
         self.bind_all("<End>", lambda e: self.scroll_grid_to(e, 1.0))
@@ -1564,6 +1812,7 @@ class DragDropSorter(tk.Tk):
             self.save_config()
         except Exception as e:
             print(f"⚠️ Could not save settings: {e}")
+        self.history.close()
         self.destroy()
 
     WHEEL_STEP = 3        # canvas units (yscrollincrement=10px) per wheel notch
@@ -1908,10 +2157,6 @@ class DragDropSorter(tk.Tk):
             self.grid_menu.add_command(label=f"Color Balance {len(self.selected_widgets)} Photo(s)",
                                        command=self.color_balance_selection,
                                        state="disabled" if self.color_busy else "normal")
-        if self.color_undo:
-            self.grid_menu.add_command(label=f"Undo Color Balance ({len(self.color_undo)} Photo(s))",
-                                       command=self.undo_color_balance,
-                                       state="disabled" if self.color_busy else "normal")
         if self.cut_files:
             count = len(self.cut_files[1])
             if folder:
@@ -1967,7 +2212,7 @@ class DragDropSorter(tk.Tk):
             folders += len(dirnames)
             for f in filenames:
                 if LOG_FILE_RE.match(f) or f == VIEW_FILE:
-                    continue  # this app's own logs, including retired restored_* ones
+                    continue  # logs left by older versions of this app
                 if f.lower().endswith((".jpg", ".jpeg", ".png")):
                     photos += 1
                 else:
@@ -1989,7 +2234,7 @@ class DragDropSorter(tk.Tk):
             return
         trash = os.path.join(parent, TRASH_DIR)
         self.cut_folder_moved(path, os.path.join(trash, final))
-        self.write_move_log("", trash, [{"original": name, "final": final, "destination": trash}], log_dir=parent)
+        self.history.record(f"Delete Folder '{name}'", [MoveStep(path, os.path.join(trash, final))])
         if showing_it:  # the folder on screen went with it: show the one that held it
             self.image_directory = parent
             self.folder_entry.delete(0, tk.END)
@@ -2029,9 +2274,7 @@ class DragDropSorter(tk.Tk):
             messagebox.showerror("Rename Folder", f"Could not rename '{name}':\n{e}")
             return
         self.folder_path_changed(old_path, new_path)
-        # Logged as a move within the folder holding it, so Restore From Log there renames it back.
-        self.write_move_log("", parent, [{"original": name, "final": new_name, "destination": parent}],
-                            log_dir=parent)
+        self.history.record(f"Rename Folder '{name}'", [MoveStep(old_path, new_path)])
         self.loading_label.config(text=f"Renamed folder '{name}' to '{new_name}'.")
         self.refresh_folders()
 
@@ -2042,6 +2285,7 @@ class DragDropSorter(tk.Tk):
         parent = parent or self.image_directory
         try:
             os.mkdir(os.path.join(parent, name))
+            self.history.record(f"New Folder '{name}'", [MkdirStep(os.path.join(parent, name))])
         except FileExistsError:
             messagebox.showerror("New Folder", f"'{name}' already exists.")
             return
@@ -2067,16 +2311,14 @@ class DragDropSorter(tk.Tk):
         return None
 
     def move_to_folder(self, group, dest_dir):
-        """Move photos dragged onto a folder tile or tree row, keeping their names.
-        Logged like Move & Rename, so Restore From Log puts them back."""
+        """Move photos dragged onto a folder tile or tree row, keeping their names."""
         moved = set(self.move_files(self.image_directory, [d["filename"] for d in group], dest_dir))
         self.remove_moved_from_grid([d for d in group if d["filename"] in moved])
         self.loading_label.config(text=f"Moved {len(moved)} file(s) to {os.path.basename(dest_dir)}.")
 
-    def move_files(self, src_dir, names, dest_dir):
-        """Move files between folders keeping their names, logged in src_dir so
-        Restore From Log there puts them back. Returns the names that moved."""
-        moved, log_entries = [], []
+    def move_files(self, src_dir, names, dest_dir, label="Move"):
+        """Move files between folders keeping their names. Returns the names that moved."""
+        moved, steps = [], []
         for name in names:
             old_path = os.path.join(src_dir, name)
             new_path = os.path.join(dest_dir, name)
@@ -2090,9 +2332,9 @@ class DragDropSorter(tk.Tk):
             except Exception as e:
                 print(f"⚠️ Move failed for {name}: {e}")
                 continue
-            log_entries.append({"original": name, "final": name, "destination": dest_dir})
+            steps.append(MoveStep(old_path, new_path))
             moved.append(name)
-        self.write_move_log("", dest_dir, log_entries, log_dir=src_dir)
+        self.history.record(f"{label} {len(moved)} Photo(s) to '{os.path.basename(dest_dir)}'", steps)
         return moved
 
     def cut_selection(self, event=None):
@@ -2147,7 +2389,7 @@ class DragDropSorter(tk.Tk):
             messagebox.showwarning("Paste", f"None of the {len(names)} cut photo(s) are in\n{src_dir}\n"
                                    "any more. Nothing was moved.")
             return
-        moved = self.move_files(src_dir, present, dest_dir)
+        moved = self.move_files(src_dir, present, dest_dir, label="Paste")
         self.cut_files = None
         missing = len(names) - len(present)
         note = f" {missing} could not be found." if missing else ""
@@ -2283,6 +2525,72 @@ class DragDropSorter(tk.Tk):
         data["label"].image = photo
         data["photo"] = photo
 
+    def update_edit_menu(self):
+        for index, label, action in ((0, self.history.undo_label(), "Undo"),
+                                     (1, self.history.redo_label(), "Redo")):
+            self.edit_menu.entryconfig(index, label=f"{action} {label}" if label else action,
+                                       state="normal" if label and not self.color_busy else "disabled")
+
+    def undo(self, event=None):
+        return self.run_history(event, undo=True)
+
+    def redo(self, event=None):
+        return self.run_history(event, undo=False)
+
+    def run_history(self, event, undo):
+        if event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
+            return  # Ctrl-Z in a text field keeps its usual meaning
+        action = "Undo" if undo else "Redo"
+        label = self.history.undo_label() if undo else self.history.redo_label()
+        if not label:
+            self.loading_label.config(text=f"Nothing to {action.lower()}.")
+            return "break"
+        if self.color_busy:
+            self.loading_label.config(text=f"Wait for the color balance to finish before {action.lower()}ing.")
+            return "break"
+        # Changing files reloads the grid, which drops a reorder that isn't saved yet.
+        if self.is_loading() or not self.check_unsaved_changes():
+            return "break"
+        loaded = self.grid_directory is not None
+        label, steps, touched, problems = self.history.undo() if undo else self.history.redo()
+
+        # Follow folders that moved back (or forward), including the one on screen.
+        for step in reversed(steps) if undo else steps:
+            if isinstance(step, MoveStep):
+                old, new = (step.dst, step.src) if undo else (step.src, step.dst)
+                if os.path.isdir(new):
+                    self.folder_path_changed(old, new)
+        folder = self.image_directory
+        while folder and not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+            folder = os.path.dirname(folder)
+        if folder != self.image_directory:
+            self.image_directory = folder
+            self.folder_entry.delete(0, tk.END)
+            self.folder_entry.insert(0, folder)
+        if loaded:
+            self.clear_grid()
+            self.start_thumbnail_loading()
+        else:
+            self.refresh_tree()
+
+        timeline = self.timeline_window if self.timeline_window and self.timeline_window.winfo_exists() else None
+        for path in set(touched):
+            if timeline:
+                timeline.photo_changed(path)
+            for viewer in list(ImageViewer.open_viewers):
+                viewer.file_changed(path)
+
+        done = "Undid" if undo else "Redid"
+        self.loading_label.config(text=f"{'↩️' if undo else '↪️'} {done} {label}."
+                                  + (f" {len(problems)} step(s) couldn't be done." if problems else ""))
+        print(f"{done} {label}")
+        if problems:
+            for p in problems:
+                print(f"⚠️ {p}")
+            messagebox.showwarning(action, f"{done} {label}, but {len(problems)} step(s) couldn't be done:\n\n"
+                                   + "\n".join(problems[:8]) + ("\n..." if len(problems) > 8 else ""))
+        return "break"
+
     def color_balance_selection(self):
         """Auto colour balance the selected photos in place, one pass each, the
         originals going to .trash. Runs in the background; Undo puts them back."""
@@ -2300,7 +2608,7 @@ class DragDropSorter(tk.Tk):
         for n, path in enumerate(paths, 1):
             try:
                 trashed = save_color_balanced(path)
-                done.append((path, trashed, source_key(path)))
+                done.append((path, trashed))
                 print(f"🎨 Color balanced {path} (original in {TRASH_DIR}/{trashed})")
                 self.after(0, self.photo_changed, path)
             except Exception as e:
@@ -2312,35 +2620,13 @@ class DragDropSorter(tk.Tk):
 
     def color_balance_done(self, done, failed):
         self.color_busy = False
-        self.color_undo = done
+        self.history.record(f"Color Balance {len(done)} Photo(s)",
+                            [step for path, trashed in done for step in color_balance_steps(path, trashed)])
         text = f"🎨 Color balanced {len(done)} photo(s)."
         if failed:
             text += f" {failed} failed (see terminal)."
         if done:
-            text += " Right-click → Undo Color Balance to restore."
-        self.loading_label.config(text=text)
-
-    def undo_color_balance(self):
-        """Put back the originals from the last color balance. A photo is skipped if
-        it has changed since (renamed, moved, edited), so nothing else is overwritten."""
-        if self.color_busy:
-            return
-        restored, skipped = 0, []
-        for path, trashed, key in self.color_undo:
-            original = os.path.join(os.path.dirname(path), TRASH_DIR, trashed)
-            try:
-                if not os.path.exists(original) or source_key(path) != key:
-                    raise FileNotFoundError
-                os.replace(original, path)
-            except OSError:
-                skipped.append(os.path.basename(path))
-                continue
-            restored += 1
-            self.photo_changed(path)
-        self.color_undo = []
-        text = f"↩️ Restored {restored} original(s)."
-        if skipped:
-            text += f" Skipped {len(skipped)} changed since: {', '.join(skipped[:5])}" + ("..." if len(skipped) > 5 else "")
+            text += " Ctrl+Z undoes it."
         self.loading_label.config(text=text)
 
     def keyword_targets(self):
@@ -2366,7 +2652,7 @@ class DragDropSorter(tk.Tk):
 
         to_delete = [d for d in self.image_data if d["label"] in self.selected_widgets]
         trash = os.path.join(self.image_directory, TRASH_DIR)
-        trashed, log_entries = [], []
+        trashed, steps = [], []
         for data in to_delete:
             path = os.path.join(self.image_directory, data["filename"])
             try:
@@ -2376,13 +2662,12 @@ class DragDropSorter(tk.Tk):
             except Exception as e:
                 print(f"⚠️ Could not move {path} to {TRASH_DIR}: {e}")
                 continue
-            log_entries.append({"original": data["filename"], "final": final, "destination": trash})
+            steps.append(MoveStep(path, os.path.join(trash, final)))
             trashed.append(data)
         self.remove_moved_from_grid(trashed)
         if trashed:
             self.loading_label.config(text=f"Moved {len(trashed)} photo(s) to {TRASH_DIR}.")
-        # Logged like a move, so Restore From Log brings them back.
-        self.write_move_log("", trash, log_entries)
+        self.history.record(f"Delete {len(trashed)} Photo(s)", steps)
 
     def create_drag_cursor(self, event):
         if getattr(self, "drag_overlay", None):
@@ -2471,6 +2756,7 @@ class DragDropSorter(tk.Tk):
             return
         try:
             rotate_jpeg(path, clockwise)
+            self.history.record(f"Rotate {data['filename']}", [RotateStep(path, clockwise)])
             img = self.load_thumbnail(path)
         except Exception as e:
             print(f"⚠️ Could not rotate {data['filename']}: {e}")
@@ -2567,8 +2853,7 @@ class DragDropSorter(tk.Tk):
             self._tree_click = False  # in case the folder wasn't opened
 
     def move_folder(self, src, dest_dir):
-        """Move a folder into another one. Logged like photo moves in the folder it
-        left, so Restore From Log there puts it back."""
+        """Move a folder into another one."""
         name = os.path.basename(src)
         if os.path.exists(os.path.join(dest_dir, name)):
             messagebox.showerror("Move Folder", f"'{name}' already exists in {os.path.basename(dest_dir)}.")
@@ -2579,8 +2864,7 @@ class DragDropSorter(tk.Tk):
             messagebox.showerror("Move Folder", f"Could not move '{name}':\n{e}")
             return
         self.folder_path_changed(src, os.path.join(dest_dir, name))
-        self.write_move_log("", dest_dir, [{"original": name, "final": name, "destination": dest_dir}],
-                            log_dir=os.path.dirname(src))
+        self.history.record(f"Move Folder '{name}'", [MoveStep(src, os.path.join(dest_dir, name))])
         self.refresh_folders()
         self.loading_label.config(text=f"Moved folder '{name}' into {os.path.basename(dest_dir)}.")
 
@@ -2720,7 +3004,7 @@ class DragDropSorter(tk.Tk):
         if prefix and not prefix.endswith("_"):
             prefix += "_"
         prefix_date = parse_date_from_prefix(prefix)
-        log_entries, temp_names = [], []
+        log_entries, temp_names, steps = [], [], []
 
         for idx, data in enumerate(self.image_data, start=1):
             old_path = os.path.join(self.image_directory, data["filename"])
@@ -2730,6 +3014,7 @@ class DragDropSorter(tk.Tk):
             try:
                 os.rename(old_path, temp_path)
                 move_cached_thumb(old_path, temp_path)
+                steps.append(MoveStep(old_path, temp_path))
             except Exception as e:
                 print(f"⚠️ Rename failed: {e}")
                 continue
@@ -2748,6 +3033,7 @@ class DragDropSorter(tk.Tk):
             try:
                 os.rename(temp_path, final_path)
                 move_cached_thumb(temp_path, final_path)
+                steps.append(MoveStep(temp_path, final_path))
             except Exception as e:
                 print(f"⚠️ Final rename failed: {e}")
                 continue
@@ -2756,8 +3042,9 @@ class DragDropSorter(tk.Tk):
 
             if prefix_date and ext in JPEG_EXTENSIONS:
                 try:
+                    before = read_jpeg_dates(final_path)
                     set_jpeg_date_taken(final_path, prefix_date)
-                    log_entries[idx - 1]["exif_date"] = prefix_date.isoformat()
+                    steps.append(ExifDateStep(final_path, before, read_jpeg_dates(final_path)))
                 except Exception as e:
                     print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
 
@@ -2766,20 +3053,7 @@ class DragDropSorter(tk.Tk):
                                {e["original"]: e["final"] for e in log_entries if "final" in e})
         self.loading_label.config(text=f"File renames complete.")
 
-        # Save JSON log
-        timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
-        log_name = f"rename_log_{timestamp}.json"
-        log_path = os.path.join(self.image_directory, log_name)
-        try:
-            with open(log_path, "w") as f:
-                json.dump({
-                    "timestamp": timestamp,
-                    "prefix": prefix,
-                    "files": log_entries
-                }, f, indent=2)
-            print(f"📝 Rename log saved: {log_name}")
-        except Exception as e:
-            print(f"⚠️ Log save failed: {e}")
+        self.history.record(f"Rename {len(temp_names)} Photo(s)", steps)
 
         self.redraw_grid()
 
@@ -2826,7 +3100,7 @@ class DragDropSorter(tk.Tk):
 
         start_idx = find_next_index(dest_dir, prefix)
         prefix_date = parse_date_from_prefix(prefix)
-        moved, log_entries = [], []
+        moved, steps = [], []
 
         for offset, data in enumerate(to_move):
             idx = start_idx + offset
@@ -2846,26 +3120,24 @@ class DragDropSorter(tk.Tk):
             try:
                 shutil.move(old_path, final_path)
                 move_cached_thumb(old_path, final_path)
+                steps.append(MoveStep(old_path, final_path))
             except Exception as e:
                 print(f"⚠️ Move failed for {data['filename']}: {e}")
                 continue
 
             if prefix_date and ext in JPEG_EXTENSIONS:
                 try:
+                    before = read_jpeg_dates(final_path)
                     set_jpeg_date_taken(final_path, prefix_date)
+                    steps.append(ExifDateStep(final_path, before, read_jpeg_dates(final_path)))
                 except Exception as e:
                     print(f"⚠️ Could not set EXIF date for {final_name}: {e}")
 
-            log_entries.append({
-                "original": data["filename"],
-                "final": final_name,
-                "destination": dest_dir,
-            })
             moved.append(data)
 
         self.remove_moved_from_grid(moved)
         self.loading_label.config(text=f"Moved {len(moved)} file(s) to {dest_dir}.")
-        self.write_move_log(prefix, dest_dir, log_entries)
+        self.history.record(f"Move & Rename {len(moved)} Photo(s)", steps)
 
     def remove_moved_from_grid(self, moved):
         for data in moved:
@@ -2880,106 +3152,6 @@ class DragDropSorter(tk.Tk):
         # reordering of the files left behind as saved.
         moved_names = {d["filename"] for d in moved}
         self.on_disk_order = [f for f in self.on_disk_order if f not in moved_names]
-
-    def write_move_log(self, prefix, dest_dir, log_entries, log_dir=None):
-        """Write a move log into log_dir (the folder the files left; by default the
-        one on screen), where Restore From Log looks for it."""
-        log_dir = log_dir or self.image_directory
-        if log_entries:
-            timestamp = datetime.datetime.now().isoformat(timespec="seconds").replace(":", "-")
-            log_name, n = f"move_log_{timestamp}.json", 1
-            # Several moves can land in the same second; don't let one log replace another.
-            while os.path.exists(os.path.join(log_dir, log_name)):
-                n += 1
-                log_name = f"move_log_{timestamp}_{n}.json"
-            log_path = os.path.join(log_dir, log_name)
-            try:
-                with open(log_path, "w") as f:
-                    json.dump({
-                        "timestamp": timestamp,
-                        "prefix": prefix,
-                        "destination": dest_dir,
-                        "files": log_entries
-                    }, f, indent=2)
-                print(f"📝 Move log saved: {log_name}")
-            except Exception as e:
-                print(f"⚠️ Log save failed: {e}")
-
-    def restore_from_log(self):
-        """Undo the most recent rename or move made from this folder, using its log."""
-        if self.is_loading():
-            return
-        logs = [f for f in os.listdir(self.image_directory)
-                if f.startswith(("rename_log_", "move_log_")) and f.endswith(".json")]
-        if not logs:
-            messagebox.showerror("Restore Error", "No rename or move logs found.")
-            return
-        # Both log types share the timestamp suffix, so order by that, not by prefix;
-        # the timestamp only has 1s resolution, so break ties by file mtime.
-        log_name = max(logs, key=lambda f: (f.split("_log_", 1)[1],
-                                            os.path.getmtime(os.path.join(self.image_directory, f))))
-        log_path = os.path.join(self.image_directory, log_name)
-        try:
-            with open(log_path, "r") as f:
-                log = json.load(f)
-        except Exception:
-            messagebox.showerror("Error", f"Could not read {log_name}")
-            return
-
-        entries = log.get("files", [])
-        is_move = log_name.startswith("move_log_")
-        if is_move:
-            prompt = (f"Move {len(entries)} file(s) back from:\n{log.get('destination', '')}\n"
-                      f"and restore their original names?\n\n({log_name})")
-        else:
-            prompt = f"Restore original filenames from {log_name}?"
-        if not messagebox.askyesno("Confirm Restore", prompt):
-            return
-
-        restored, renames = 0, {}
-        for entry in entries:
-            if is_move:
-                current = os.path.join(entry.get("destination", log.get("destination", "")), entry["final"])
-            else:
-                current = os.path.join(self.image_directory, entry.get("final", entry["temporary"]))
-            original = os.path.join(self.image_directory, entry["original"])
-            if not os.path.exists(current) and os.path.exists(original):
-                restored += 1  # already put back by an earlier, partial restore
-                continue
-            if os.path.exists(original) and current != original:
-                overwrite = messagebox.askyesno("Conflict Warning",
-                    f"File '{entry['original']}' already exists.\nOverwrite?")
-                if not overwrite:
-                    continue
-            try:
-                shutil.move(current, original) if is_move else os.rename(current, original)
-                move_cached_thumb(current, original)
-                restored += 1
-                if not is_move:
-                    renames[os.path.basename(current)] = entry["original"]
-            except Exception as e:
-                print(f"⚠️ Could not restore {os.path.basename(current)}: {e}")
-
-        self.cut_files_renamed(self.image_directory, renames)
-        # Retire a fully-restored log so it isn't offered again: once a move is undone,
-        # later moves reuse those destination names, and replaying the old log would
-        # pull the new files back. A partial restore keeps the log so it can be retried.
-        if restored == len(entries):
-            retired, n = f"restored_{log_name}", 1
-            while os.path.exists(os.path.join(self.image_directory, retired)):
-                n += 1
-                retired = f"restored{n}_{log_name}"
-            try:
-                os.rename(log_path, os.path.join(self.image_directory, retired))
-            except Exception as e:
-                print(f"⚠️ Could not retire {log_name}: {e}")
-            messagebox.showinfo("Restore Complete", f"Restored {restored} files from {log_name}")
-        else:
-            messagebox.showwarning("Restore Incomplete",
-                f"Restored {restored} of {len(entries)} files from {log_name}.\n"
-                "The log was kept so the rest can be retried.")
-        self.clear_grid()
-        self.start_thumbnail_loading()
 
     def auto_scroll(self):
         """Scroll while a drag is held near (or past) the top or bottom edge of the

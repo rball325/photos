@@ -48,6 +48,8 @@ Two classes in one file:
 
 **Threading**: thumbnail loading runs in a daemon thread (`load_thumbnails_thread`). All UI updates from that thread go through `self.after(0, ...)` to stay on the main thread.
 
-**Rename flow**: two-phase to avoid collisions — first rename all files to `_temp_NNN.ext`, then rename temps to `prefix_NNN.ext`. A `rename_log_*.json` is written into the image directory after each rename and can be used by "Restore From Log" to reverse the operation.
+**Rename flow**: two-phase to avoid collisions — first rename all files to `_temp_NNN.ext`, then rename temps to `prefix_NNN.ext`. Renames are reversed with undo; no log file is written.
+
+**Undo/redo**: `self.history` (a `History`) holds every file-changing command for the session, as a label plus the steps it took (`MoveStep`, `CreateStep`, `MkdirStep`, `RotateStep`, `ExifDateStep`, `KeywordsStep`). Steps record how to reverse themselves rather than copying photos. Any new command that changes files should build a step list and call `self.history.record(label, steps)`. Undone files that were created (such as color-balanced photos) are parked in `~/.cache/photo_sorter/undo/<pid>/`, cleared on exit.
 
 **Config**: `config.json` (photo_sorter) and `photo_resizer_settings.json` (resize.py) are written relative to CWD, not the script directory.

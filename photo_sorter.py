@@ -3,6 +3,7 @@ from tkinter import messagebox
 from tkinter import filedialog
 from tkinter import simpledialog
 from tkinter import ttk
+from tkinter import font as tkfont
 from PIL import Image, ImageTk, ImageOps, ImageStat, IptcImagePlugin, PngImagePlugin
 import os, json, threading, bisect, datetime, calendar, re, shutil, math, stat, subprocess, time
 import xml.etree.ElementTree as ET
@@ -247,6 +248,26 @@ def edit_keywords(paths, add=(), remove=()):
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"exiftool exited with {result.returncode}")
     return result.stderr.strip()
+
+
+def image_dimensions(path):
+    """Width and height as displayed (EXIF-rotated photos swapped), read from
+    the header only; None if it can't be read."""
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if img.getexif().get(0x0112) in (5, 6, 7, 8):  # turned 90°
+                w, h = h, w
+            return w, h
+    except Exception:
+        return None
+
+
+def format_file_size(n):
+    """Compact size: 940 KB, 1.3 MB."""
+    if n < 1024 * 1024:
+        return f"{max(1, round(n / 1024))} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
 
 def find_next_index(directory, prefix):
@@ -677,6 +698,103 @@ def color_balance_steps(path, trashed):
     return [MoveStep(path, os.path.join(directory, TRASH_DIR, trashed)), CreateStep(path)]
 
 
+def read_all_metadata(path):
+    """Every metadata tag in a photo as (group, tag, value) rows: from exiftool
+    when it's installed, otherwise the EXIF that PIL can read."""
+    try:
+        result = subprocess.run(["exiftool", "-a", "-G1", path], capture_output=True, text=True, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        result = None
+    if result and result.returncode == 0:
+        rows = []
+        for line in result.stdout.splitlines():
+            m = re.match(r"\[([^\]]*)\]\s+(.*?)\s*: (.*)", line)
+            if m:
+                rows.append(m.groups())
+        return rows, "exiftool"
+    rows = []
+    with Image.open(path) as img:
+        exif = img.getexif()
+        from PIL import ExifTags
+        for ifd_name, tags in (("IFD0", exif), ("ExifIFD", exif.get_ifd(0x8769)), ("GPS", exif.get_ifd(0x8825))):
+            names = ExifTags.GPSTAGS if ifd_name == "GPS" else ExifTags.TAGS
+            for tag, value in tags.items():
+                if isinstance(value, bytes):
+                    value = f"({len(value)} bytes)"
+                rows.append((ifd_name, names.get(tag, hex(tag)), str(value)))
+        rows.insert(0, ("File", "Image Size", f"{img.width}x{img.height}"))
+    return rows, "PIL (install exiftool for the full list)"
+
+
+class MetadataWindow(tk.Toplevel):
+    """All of a photo's EXIF/XMP/IPTC tags in a searchable, copyable list."""
+
+    def __init__(self, master, path):
+        super().__init__(master)
+        name = os.path.basename(path)
+        self.title(f"EXIF Data — {name}")
+        self.geometry("720x600")
+        try:
+            master.config(cursor="watch"); master.update_idletasks()
+            self._rows, source = read_all_metadata(path)
+        except Exception as e:
+            self._rows, source = [], f"could not read: {e}"
+        finally:
+            master.config(cursor="")
+
+        top = tk.Frame(self)
+        tk.Label(top, text="Filter:").pack(side="left")
+        self._filter = tk.StringVar()
+        entry = tk.Entry(top, textvariable=self._filter)
+        entry.pack(side="left", fill="x", expand=True, padx=4)
+        tk.Button(top, text="Copy All", command=self._copy).pack(side="left")
+        top.pack(fill="x", padx=6, pady=4)
+        self._status = tk.Label(self, anchor="w", fg="gray30")
+        self._status.pack(fill="x", padx=6)
+        self._source = source
+
+        frame = tk.Frame(self)
+        # The named font itself: a ("TkFixedFont", 10) tuple is read as a family
+        # name, isn't found, and falls back to a proportional face.
+        mono = tkfont.nametofont("TkFixedFont").copy()
+        mono.configure(size=10)
+        self._text = tk.Text(frame, wrap="none", font=mono)
+        ys = tk.Scrollbar(frame, orient="vertical", command=self._text.yview)
+        xs = tk.Scrollbar(frame, orient="horizontal", command=self._text.xview)
+        self._text.config(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side="right", fill="y"); xs.pack(side="bottom", fill="x")
+        self._text.pack(fill="both", expand=True)
+        frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self._text.tag_configure("group", foreground="#2060a0")
+
+        self._filter.trace_add("write", lambda *a: self._show())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._show()
+        entry.focus_set()
+
+    def _lines(self):
+        want = self._filter.get().strip().lower()
+        rows = [r for r in self._rows if not want or want in " ".join(r).lower()]
+        width_g = max((len(g) for g, _, _ in rows), default=0)
+        width_t = max((len(t) for _, t, _ in rows), default=0)
+        return rows, width_g, width_t
+
+    def _show(self):
+        rows, wg, wt = self._lines()
+        self._text.config(state="normal")
+        self._text.delete("1.0", "end")
+        for group, tag, value in rows:
+            self._text.insert("end", f"{group:<{wg}}  ", "group")
+            self._text.insert("end", f"{tag:<{wt}}  {value}\n")
+        self._text.config(state="disabled")
+        self._status.config(text=f"{len(rows)} of {len(self._rows)} tags  ·  from {self._source}")
+
+    def _copy(self):
+        rows, wg, wt = self._lines()
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(f"{g:<{wg}}  {t:<{wt}}  {v}" for g, t, v in rows))
+
+
 class ImageViewer(tk.Toplevel):
     """Full-size view of one photo. Given the list of photos it was opened from,
     the Left and Right arrow keys step to the previous and next one."""
@@ -728,6 +846,10 @@ class ImageViewer(tk.Toplevel):
         self._canvas.bind("<Button-5>", self._on_scroll_linux)
         self._canvas.bind("<ButtonPress-1>", self._on_pan_start)
         self._canvas.bind("<B1-Motion>", self._on_pan_move)
+        self._context_menu = tk.Menu(self, tearoff=0)
+        self._context_menu.add_command(label="Show EXIF Data...",
+                                       command=lambda: MetadataWindow(self, self._paths[self._index]))
+        self._canvas.bind("<Button-3>", lambda e: self._context_menu.tk_popup(e.x_root, e.y_root))
         # Redraw on resize so newly exposed areas get filled; skipped until the first fit.
         self._canvas.bind("<Configure>", lambda e: self._photo and self._redraw())
         self.bind("<Left>", lambda e: self.step(-1))
@@ -1577,7 +1699,7 @@ class DragDropSorter(tk.Tk):
         self.folder_names = []
         self.grid_row_offset = 0
         self.load_generation = 0
-        self.metadata_cache = {}  # path -> (mtime, (date_taken, keywords))
+        self.metadata_cache = {}  # path -> (mtime, (date_taken, keywords, (w, h)))
         self.tooltip = None
         self.tooltip_after = None
         self.keywords_window = None
@@ -2154,6 +2276,11 @@ class DragDropSorter(tk.Tk):
         if not self.grid_directory:
             return
         self.grid_menu.delete(0, "end")
+        photo = next((d for d in self.image_data if d["label"] is event.widget), None)
+        if photo:
+            path = os.path.join(self.image_directory, photo["filename"])
+            self.grid_menu.add_command(label="Show EXIF Data...", command=lambda: MetadataWindow(self, path))
+            self.grid_menu.add_separator()
         self.grid_menu.add_command(label="New Folder...", command=self.create_folder)
         folder = self.folder_at(event.x_root, event.y_root)
         if self.selected_widgets:
@@ -2717,19 +2844,24 @@ class DragDropSorter(tk.Tk):
             return
         # Look up the filename now rather than at bind time: renames change it.
         path = os.path.join(self.image_directory, data["filename"])
+        size_line = ""
         try:
-            mtime = os.stat(path).st_mtime
+            st = os.stat(path)
+            mtime = st.st_mtime
             cached = self.metadata_cache.get(path)
             if cached and cached[0] == mtime:
-                date_taken, keywords = cached[1]
+                date_taken, keywords, dims = cached[1]
             else:
                 date_taken, keywords = read_photo_metadata(path)
-                self.metadata_cache[path] = (mtime, (date_taken, keywords))
+                dims = image_dimensions(path)
+                self.metadata_cache[path] = (mtime, (date_taken, keywords, dims))
+            size_line = (f"{dims[0]}×{dims[1]} · " if dims else "") + format_file_size(st.st_size) + "\n"
         except Exception as e:
             date_taken, keywords = None, []
             print(f"⚠️ Could not read metadata for {data['filename']}: {e}")
 
         text = (f"{data['filename']}\n"
+                f"{size_line}"
                 f"Date: {date_taken or '(none)'}\n"
                 f"Keywords: {', '.join(keywords) if keywords else '(none)'}")
         self.tooltip = tk.Toplevel(self)
